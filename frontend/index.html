@@ -769,9 +769,12 @@
 
 <script>
   // ── Environment & State ────────────────────────────────
+  // When served by FastAPI (http/https), use the same origin so relative routing works.
+  // When opened directly as a file:// URL, fall back to the known backend address.
+  // NOTE: always use 127.0.0.1 (not localhost) to avoid IPv6 resolution mismatches.
   const API = (window.location.protocol === "http:" || window.location.protocol === "https:")
     ? window.location.origin
-    : "http://localhost:8000";
+    : "http://127.0.0.1:8000";
 
   let isSending = false;
   let activeDocuments = [];
@@ -1168,7 +1171,12 @@
       const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: text, stream: true, history: conversationHistory.slice(-6) }),
+        body: JSON.stringify({
+          question: text,
+          stream: true,
+          history: conversationHistory.slice(-6),
+          selected_doc: activeDocuments.length === 1 ? activeDocuments[0] : null
+        }),
         signal: controller.signal
       });
       clearTimeout(timeoutTimer);
