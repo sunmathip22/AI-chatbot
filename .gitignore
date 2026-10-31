@@ -1,0 +1,61 @@
+# ─── Environment & Secrets ───────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+backend/.env
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ─── Virtual Environments ────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+backend/venv/
+
+# ─── ChromaDB Data ───────────────────────────────────────────────────────────
+backend/chromadb_data/
+chromadb_data/
+*.chroma
+
+# ─── Uploads ─────────────────────────────────────────────────────────────────
+backend/uploads/
+uploads/
+
+# ─── IDE & OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs & Temp ─────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+logs/
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+tests/__pycache__/

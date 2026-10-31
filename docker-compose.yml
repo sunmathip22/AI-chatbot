@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount code for live reloading during development
+      - ./backend:/app
+      # Persist ChromaDB data outside container
+      - ./chromadb_data:/app/chromadb_data
+      # Persist uploaded files outside container
+      - ./uploads:/app/uploads
+    environment:
+      # IMPORTANT: Point to host machine's Ollama, not localhost inside Docker
+      # Note: On Windows, Ollama by default binds to 127.0.0.1. To allow Docker containers to reach it,
+      # ensure OLLAMA_HOST=0.0.0.0 is set on the host, or run the backend natively without Docker.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - MODEL_NAME=gemma3n:e2b
+      - PROJECT_NAME=${PROJECT_NAME:-Project Documentation}
+      - PROJECT_DESCRIPTION=${PROJECT_DESCRIPTION:-Official Project Documentation Assistant}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    extra_hosts:
+      # Allows container to reach your host machine's services
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

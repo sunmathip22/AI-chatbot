@@ -1,0 +1,155 @@
+RAG//TERMINAL — SETUP GUIDE
+============================
+
+
+REQUIREMENTS
+------------
+Install these before anything else:
+
+  Python 3.11+  →  https://www.python.org/downloads/
+  Ollama        →  https://ollama.com/download
+  Docker        →  https://www.docker.com  (optional)
+
+
+────────────────────────────────────────
+ STEP 1 — GET THE PROJECT
+────────────────────────────────────────
+
+  git clone https://github.com/YOUR-USERNAME/rag-chatbot.git
+  cd rag-chatbot
+
+  Or download the ZIP from GitHub, extract it, and open a
+  terminal inside the folder.
+
+
+────────────────────────────────────────
+ STEP 2 — DOWNLOAD THE AI MODEL
+────────────────────────────────────────
+
+  Recommended (fast download, ~1.6GB):
+    ollama pull gemma2:2b
+
+  Alternative (larger multimodal model, ~5.7GB):
+    ollama pull gemma3n:e2b
+
+  Note: The chatbot automatically detects whichever model you have downloaded!
+
+
+────────────────────────────────────────
+ STEP 3 — SET UP PYTHON
+────────────────────────────────────────
+
+  cd backend
+  python -m venv venv
+
+  Activate the environment:
+
+    Windows (PowerShell)  →  .\venv\Scripts\Activate.ps1
+    Windows (CMD)         →  venv\Scripts\activate.bat
+    Mac / Linux           →  source venv/bin/activate
+
+  You should see (venv) at the start of your terminal line.
+
+  Install dependencies:
+
+    pip install -r requirements.txt
+
+  Takes 5–10 minutes. Let it finish.
+
+
+────────────────────────────────────────
+ STEP 4 — RUN THE CHATBOT
+────────────────────────────────────────
+
+  Terminal 1 — start Ollama:
+    ollama serve
+
+  Terminal 2 — start the backend (inside backend/ with venv active):
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+
+────────────────────────────────────────
+ STEP 5 — OPEN IN BROWSER
+────────────────────────────────────────
+
+  http://localhost:8000
+
+
+────────────────────────────────────────
+ USING THE CHATBOT
+────────────────────────────────────────
+
+  No document uploaded
+    Type a question and press Enter.
+    The AI answers from general knowledge.
+
+  Document uploaded (RAG mode)
+    Drag and drop a PDF or TXT into the left sidebar.
+    Wait for MODE: RAG to appear.
+    Ask questions — the AI answers from your document.
+
+
+────────────────────────────────────────
+ DOCKER (ALTERNATIVE TO STEPS 3 & 4)
+────────────────────────────────────────
+
+  From the root rag-chatbot/ folder:
+
+    docker-compose up --build
+
+  To stop:
+
+    docker-compose down
+
+  Note for Linux: if host.docker.internal fails, open
+  docker-compose.yml and set network_mode: host
+
+
+────────────────────────────────────────
+ FOLDER GUIDE
+────────────────────────────────────────
+
+  backend/          Python server — do not edit unless needed
+  frontend/         index.html — the chat UI
+  chromadb_data/    Auto-created — stores document embeddings
+  uploads/          Auto-created — stores your uploaded files
+
+
+────────────────────────────────────────
+ COMMON ERRORS
+────────────────────────────────────────
+
+  "Connection refused on port 11434"
+    →  Run: ollama serve
+
+  "model gemma3n:e2b not found"
+    →  Run: ollama pull gemma3n:e2b
+
+  "Activate.ps1 cannot be loaded"
+    →  Run: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+  "ModuleNotFoundError"
+    →  venv is not active, or install did not finish
+    →  Activate venv and re-run: pip install -r requirements.txt
+
+  Responses are very slow
+    →  Normal on CPU. Just wait — it will respond.
+
+
+────────────────────────────────────────
+ STOPPING THE SERVER
+────────────────────────────────────────
+
+  Press Ctrl + C in the terminal running uvicorn.
+
+
+────────────────────────────────────────
+ STARTING AGAIN NEXT TIME
+────────────────────────────────────────
+
+  1.  ollama serve
+  2.  cd rag-chatbot/backend
+  3.  .\venv\Scripts\Activate.ps1   (Windows)
+      source venv/bin/activate      (Mac/Linux)
+  4.  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  5.  Open http://localhost:8000
