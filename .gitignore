@@ -1,8 +1,20 @@
 # ─── Environment & Secrets ───────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 backend/.env
+backend/.env.*
+
+# ─── Local Model Files ───────────────────────────────────────────────────────
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+models/
 
 # ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
@@ -23,9 +35,11 @@ pip-delete-this-directory.txt
 # ─── Virtual Environments ────────────────────────────────────────────────────
 venv/
 .venv/
+.venv*/
 env/
 ENV/
 backend/venv/
+backend/.venv*/
 
 # ─── ChromaDB Data ───────────────────────────────────────────────────────────
 backend/chromadb_data/
@@ -59,3 +73,4 @@ logs/
 htmlcov/
 .tox/
 tests/__pycache__/
+

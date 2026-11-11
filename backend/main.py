@@ -1,12 +1,13 @@
 import os
 import shutil
+import traceback
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 # Load environment variables from .env if present
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -56,8 +57,17 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-    """Simple endpoint to verify the server is running."""
-    return {"status": "ok", "message": "RAG Chatbot is running!"}
+    """Health endpoint returning ok, model name, indexed chunks count, and Ollama status."""
+    sys_status = get_system_status()
+    return {
+        "status": "ok",
+        "ok": True,
+        "model": sys_status.get("active_model") or sys_status.get("model_configured") or "none",
+        "chunks_indexed": sys_status.get("chunks_indexed", 0),
+        "ollama_status": "online" if sys_status.get("ollama_online") else "offline",
+        "ollama_online": sys_status.get("ollama_online", False),
+        "documents": sys_status.get("files", []),
+    }
 
 @app.get("/status")
 def system_status():
@@ -67,12 +77,15 @@ def system_status():
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    keep_existing: bool = Query(default=False, description="Set true to keep older documents; default replaces old docs."),
+):
     """
     Accept a PDF or TXT file, validate it, process it, and index it.
     - Enforces 20 MB file size limit.
-    - Detects scanned / image-only PDFs and reports clearly.
-    - Returns chunk count on success.
+    - Replaces old documents by default unless keep_existing=true.
+    - Returns chunk count and list of indexed documents on success.
     """
     # Validate file type
     allowed_types = [".pdf", ".txt"]
@@ -101,11 +114,14 @@ async def upload_document(file: UploadFile = File(...)):
         f.write(content)
 
     try:
-        chunks = process_document(file_path)
+        chunks = process_document(file_path, replace_existing=not keep_existing)
+        docs = list_documents()
+        print(f"[Upload] Active indexed documents: {[d['filename'] for d in docs]}", flush=True)
         return {
             "message": f"Successfully processed '{safe_name}'",
             "chunks_created": chunks,
             "filename": safe_name,
+            "documents": docs,
             "status": "ready"
         }
     except ValueError as e:
@@ -148,23 +164,34 @@ def delete_document(filename: str):
 def chat(request: ChatRequest):
     """
     Main chat endpoint. Supports both progressive streaming (SSE) and full JSON response.
-    Performs RAG if documents exist, direct conversational LLM otherwise.
+    Wraps both paths in try/except so errors print full tracebacks and return a short reply.
     """
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    if request.stream:
-        return StreamingResponse(
-            stream_ask_question(
-                request.question,
-                history=request.history,
-                mode=request.mode,
-                selected_doc=request.selected_doc
-            ),
-            media_type="text/event-stream"
-        )
-    
     try:
+        if not request.question or not request.question.strip():
+            raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+        if request.stream:
+            def safe_event_stream():
+                import json as _json
+                try:
+                    for chunk in stream_ask_question(
+                        request.question,
+                        history=request.history,
+                        mode=request.mode,
+                        selected_doc=request.selected_doc
+                    ):
+                        yield chunk
+                except Exception as stream_exc:
+                    print(f"[Chat Stream Error] {stream_exc}", flush=True)
+                    traceback.print_exc()
+                    yield f"data: {_json.dumps({'token': 'Sorry, a temporary error occurred. Please try again.'})}\n\n"
+                    yield f"data: {_json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+
+            return StreamingResponse(
+                safe_event_stream(),
+                media_type="text/event-stream"
+            )
+
         result = ask_question(
             request.question,
             history=request.history,
@@ -175,8 +202,19 @@ def chat(request: ChatRequest):
         result["model_type"] = result.get("model_type", get_model_type())
         result["escalate"] = result.get("escalate", False)
         return ChatResponse(**result)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        print(f"[Chat Error] /chat exception: {e}", flush=True)
+        traceback.print_exc()
+        return ChatResponse(
+            answer="Sorry, a temporary error occurred while processing your request. Please try again.",
+            sources=[],
+            mode="direct",
+            project_name=get_project_name(),
+            model_type=get_model_type(),
+            escalate=False,
+        )
 
 @app.delete("/clear")
 def clear_documents():

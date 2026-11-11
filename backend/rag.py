@@ -4,6 +4,8 @@ import json
 import math
 import shutil
 import time
+import difflib
+import traceback
 import urllib.request
 import urllib.error
 
@@ -59,9 +61,9 @@ except ImportError:
     pass
 
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL_NAME = "gemma3n:e2b"
-DEFAULT_EMBEDDING_MODEL_NAME = "embeddinggemma-2"
-DEFAULT_GROQ_FALLBACK_MODEL = "gemma2-9b-it"
+DEFAULT_MODEL_NAME = ""
+DEFAULT_EMBEDDING_MODEL_NAME = ""
+DEFAULT_GROQ_FALLBACK_MODEL = ""
 DEFAULT_PROJECT_NAME = "Project Documentation"
 DEFAULT_PROJECT_DESCRIPTION = "Official Project Documentation"
 
@@ -81,7 +83,7 @@ def get_configured_model() -> str:
     return os.getenv("MODEL_NAME", DEFAULT_MODEL_NAME).strip()
 
 def get_embedding_model_name() -> str:
-    return os.getenv("EMBEDDING_MODEL_NAME", DEFAULT_EMBEDDING_MODEL_NAME).strip() or DEFAULT_EMBEDDING_MODEL_NAME
+    return os.getenv("EMBEDDING_MODEL_NAME", DEFAULT_EMBEDDING_MODEL_NAME).strip()
 
 def get_groq_api_key() -> str:
     return os.getenv("GROQ_API_KEY", "").strip()
@@ -102,12 +104,15 @@ GROQ_FALLBACK_MODEL = get_groq_fallback_model()
 # Retrieval, Routing & Generation Settings (.env)
 DEFAULT_SIMILARITY_THRESHOLD = 0.35
 DEFAULT_TOP_K = 2
-DEFAULT_CHUNK_SIZE = 350
-DEFAULT_CHUNK_OVERLAP = 40
-DEFAULT_NUM_CTX = 2048
-DEFAULT_NUM_PREDICT = 120
+DEFAULT_TOP_K_LIST = 4
+DEFAULT_CHUNK_SIZE = 150
+DEFAULT_CHUNK_OVERLAP = 20
+DEFAULT_NUM_CTX = 1536
+DEFAULT_NUM_PREDICT = 80
+DEFAULT_NUM_PREDICT_LIST = 150
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_KEEP_ALIVE = "30m"
+DEFAULT_OLLAMA_TIMEOUT = 180
 
 def get_similarity_threshold() -> float:
     try:
@@ -120,6 +125,12 @@ def get_top_k() -> int:
         return int(os.getenv("TOP_K", str(DEFAULT_TOP_K)))
     except ValueError:
         return DEFAULT_TOP_K
+
+def get_top_k_list() -> int:
+    try:
+        return int(os.getenv("TOP_K_LIST", str(DEFAULT_TOP_K_LIST)))
+    except ValueError:
+        return DEFAULT_TOP_K_LIST
 
 def get_chunk_size() -> int:
     try:
@@ -145,6 +156,12 @@ def get_num_predict() -> int:
     except ValueError:
         return DEFAULT_NUM_PREDICT
 
+def get_num_predict_list() -> int:
+    try:
+        return int(os.getenv("NUM_PREDICT_LIST", str(DEFAULT_NUM_PREDICT_LIST)))
+    except ValueError:
+        return DEFAULT_NUM_PREDICT_LIST
+
 def get_temperature() -> float:
     try:
         return float(os.getenv("TEMPERATURE", str(DEFAULT_TEMPERATURE)))
@@ -153,6 +170,12 @@ def get_temperature() -> float:
 
 def get_keep_alive() -> str:
     return os.getenv("KEEP_ALIVE", DEFAULT_KEEP_ALIVE).strip() or DEFAULT_KEEP_ALIVE
+
+def get_ollama_timeout() -> int:
+    try:
+        return int(os.getenv("OLLAMA_TIMEOUT", str(DEFAULT_OLLAMA_TIMEOUT)))
+    except ValueError:
+        return DEFAULT_OLLAMA_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # Persistent ChromaDB Client & In-Memory Cache (Initialized ONCE at startup)
@@ -188,19 +211,21 @@ def normalize_query(query: str) -> str:
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean
 
-def get_cached_response(query: str) -> dict | None:
+def get_cached_response(query: str, doc_key: str = "") -> dict | None:
     norm = normalize_query(query)
-    if norm in _query_cache:
-        return dict(_query_cache[norm])
+    key = f"{doc_key}::{norm}" if doc_key else norm
+    if key in _query_cache:
+        return dict(_query_cache[key])
     return None
 
-def set_cached_response(query: str, response: dict):
+def set_cached_response(query: str, response: dict, doc_key: str = ""):
     norm = normalize_query(query)
     if norm:
+        key = f"{doc_key}::{norm}" if doc_key else norm
         if len(_query_cache) >= 500:
             first_key = next(iter(_query_cache))
             del _query_cache[first_key]
-        _query_cache[norm] = response
+        _query_cache[key] = response
 
 def clear_query_cache():
     global _query_cache
@@ -382,8 +407,8 @@ CONCEPT_MAP = {
     "theva": ["requirements", "prerequisites", "dependencies"],
     "தேவை": ["requirements", "prerequisites", "dependencies"],
     # Architecture / Model / Stack
-    "model": ["model", "slm", "gemma", "ollama"],
-    "மாதிரி": ["model", "slm", "gemma", "ollama"],
+    "model": ["model", "slm", "llm", "ollama"],
+    "மாதிரி": ["model", "slm", "llm", "ollama"],
     "stack": ["stack", "backend", "frontend", "docker"],
     # Errors & Troubleshooting
     "error": ["error", "fix", "troubleshooting", "failed"],
@@ -471,13 +496,15 @@ class DocChunk:
 
 def generate_embeddings(texts: list[str]) -> tuple[list[list[float]] | None, str | None]:
     """
-    Generate dense embeddings using EmbeddingGemma 2 via Ollama /api/embed.
+    Generate dense embeddings using the configured Ollama embedding model via /api/embed.
     Returns (list_of_embeddings, error_message).
     """
     if not texts:
         return [], None
 
     model = get_embedding_model_name()
+    if not model:
+        return None, "EMBEDDING_MODEL_NAME is not configured in .env"
     base_url = get_ollama_base_url()
     status = check_ollama_status()
     if not status["online"]:
@@ -487,14 +514,15 @@ def generate_embeddings(texts: list[str]) -> tuple[list[list[float]] | None, str
         url = f"{base_url}/api/embed"
         payload = {
             "model": model,
-            "input": texts
+            "input": texts,
+            "keep_alive": get_keep_alive()
         }
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "User-Agent": "RAG-Chatbot"}
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=get_ollama_timeout()) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             embs = data.get("embeddings", [])
             if embs and len(embs) == len(texts):
@@ -515,17 +543,24 @@ class DocumentStore:
     def __init__(self):
         self.chunks: list[DocChunk] = []
         self.file_registry = {}  # {filename: chunk_count}
+        self.last_uploaded_doc: str | None = None
         self.load()
 
     def load(self):
         self.chunks = []
         self.file_registry = {}
+        self.last_uploaded_doc = None
         if os.path.exists(STORE_FILE):
             try:
                 with open(STORE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.chunks = [DocChunk.from_dict(c) for c in data.get("chunks", [])]
                     self.file_registry = data.get("file_registry", {})
+                    last_doc = data.get("last_uploaded_doc")
+                    if last_doc and last_doc in self.file_registry:
+                        self.last_uploaded_doc = last_doc
+                    elif self.file_registry:
+                        self.last_uploaded_doc = list(self.file_registry.keys())[-1]
             except Exception as e:
                 print(f"[Store] Warning: Could not load existing store: {e}")
 
@@ -534,21 +569,37 @@ class DocumentStore:
             with open(STORE_FILE, "w", encoding="utf-8") as f:
                 json.dump({
                     "chunks": [c.to_dict() for c in self.chunks],
-                    "file_registry": self.file_registry
+                    "file_registry": self.file_registry,
+                    "last_uploaded_doc": self.last_uploaded_doc
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[Store] Warning: Could not save store: {e}")
 
-    def add_chunks(self, filename: str, new_chunks: list[DocChunk]):
+    def add_chunks(self, filename: str, new_chunks: list[DocChunk], replace_existing: bool = True):
         clean_name = os.path.basename(filename)
-        self.chunks = [c for c in self.chunks if c.source != clean_name]
+        if replace_existing:
+            self.chunks = []
+            self.file_registry = {}
+            if os.path.exists(UPLOADS_PATH):
+                for existing_file in os.listdir(UPLOADS_PATH):
+                    if existing_file != clean_name:
+                        old_path = os.path.join(UPLOADS_PATH, existing_file)
+                        try:
+                            if os.path.isfile(old_path):
+                                os.remove(old_path)
+                        except OSError:
+                            pass
+        else:
+            self.chunks = [c for c in self.chunks if c.source != clean_name]
         self.chunks.extend(new_chunks)
         self.file_registry[clean_name] = len(new_chunks)
+        self.last_uploaded_doc = clean_name
         self.save()
 
     def clear(self):
         self.chunks = []
         self.file_registry = {}
+        self.last_uploaded_doc = None
         if os.path.exists(STORE_FILE):
             try:
                 os.remove(STORE_FILE)
@@ -566,8 +617,9 @@ class DocumentStore:
         query_embedding: list[float],
         k: int = 4,
         threshold: float = 0.30,
-        source_filter: str | None = None
-    ) -> tuple[list[DocChunk], float, str | None]:
+        source_filter: str | None = None,
+        return_scores: bool = False,
+    ):
         """
         Cosine similarity search using vector embeddings (from EmbeddingGemma 2).
         Supports isolating document context by source_filter.
@@ -615,7 +667,13 @@ class DocumentStore:
                 scored.sort(key=lambda x: x[0], reverse=True)
 
             best_score = float(scored[0][0]) if scored else 0.0
-            relevant = [chunk for score, chunk in scored if score >= threshold][:k]
+            relevant_pairs = [(chunk, float(score)) for score, chunk in scored if score >= threshold][:k]
+            if return_scores:
+                return relevant_pairs, best_score, None
+            log_pairs = relevant_pairs if relevant_pairs else [(chunk, float(score)) for score, chunk in scored[:min(2, len(scored))]]
+            for chunk, sc in log_pairs:
+                print(f"[Retrieval] Chunk: {chunk.source} (page {chunk.page + 1}) | similarity={sc:.4f}", flush=True)
+            relevant = [chunk for chunk, _ in relevant_pairs]
             return relevant, best_score, None
         except Exception as e:
             return [], 0.0, f"Vector search error: {str(e)}"
@@ -627,6 +685,58 @@ class DocumentStore:
             raise RuntimeError(err)
         return chunks
 
+    _GENERIC_TOPIC_STOPWORDS = {
+        "what", "when", "where", "which", "who", "whom", "how", "why", "is", "are", "was", "were",
+        "do", "does", "did", "can", "could", "will", "would", "should", "have", "has", "had",
+        "you", "your", "yours", "we", "our", "they", "their", "this", "that", "these", "those",
+        "the", "a", "an", "and", "or", "for", "of", "to", "in", "on", "at", "by", "with", "from",
+        "about", "tell", "me", "give", "show", "any", "some", "please", "pls",
+        "price", "prices", "rate", "rates", "cost", "costs", "charge", "charges", "fee", "fees",
+        "detail", "details", "info", "information", "available", "availability", "stock",
+        "enna", "evlo", "evalo", "evvalavu", "ethana", "irukku", "irukka", "iruka", "irukkum",
+        "unga", "ungala", "ungalukku", "kita", "kitta", "ta", "la", "le", "ku", "kku", "oda",
+        "pathi", "paththi", "sollu", "sollunga", "pannunga", "panunga", "vaanga", "vaangalam",
+        "kedaikuma", "kidaikkuma", "kidaikuma", "aagum", "aagudhu", "venum", "eppadi", "epdi",
+        "eppo", "enga", "edhu", "ethu", "idhu", "ithu", "adhu", "athu", "lam", "ellam",
+    }
+
+    @classmethod
+    def _extract_topic_tokens(cls, query: str) -> list[str]:
+        tokens = re.findall(r"[a-zA-Z0-9]+", (query or "").lower())
+        topic = []
+        for t in tokens:
+            if len(t) < 3 or t in cls._GENERIC_TOPIC_STOPWORDS:
+                continue
+            topic.append(t)
+        return topic
+
+    @staticmethod
+    def _chunk_keyword_hits(chunk_text: str, topic_tokens: list[str]) -> int:
+        text_low = (chunk_text or "").lower()
+        hits = 0
+        for tok in topic_tokens:
+            stem = tok[:5] if len(tok) >= 6 else tok
+            if re.search(rf"\b{re.escape(tok)}\b", text_low) or (
+                len(stem) >= 4 and re.search(rf"\b{re.escape(stem)}", text_low)
+            ):
+                hits += 1
+        return hits
+
+    @classmethod
+    def _chunk_rerank_score(cls, chunk_text: str, query: str, topic_tokens: list[str]) -> tuple[int, int, int]:
+        text_low = (chunk_text or "").lower()
+        distinct_hits = cls._chunk_keyword_hits(text_low, topic_tokens)
+        # Prefer chunks matching a multi-word phrase (e.g. 'cotton saree', 'silk saree', 'return policy')
+        phrase_hits = 0
+        if len(topic_tokens) >= 2:
+            for i in range(len(topic_tokens) - 1):
+                big = f"{topic_tokens[i]} {topic_tokens[i + 1]}"
+                if re.search(rf"\b{re.escape(big)}", text_low):
+                    phrase_hits += 1
+        # Prefer structured catalog/policy rows when multiple chunks match equally
+        is_row = 1 if ("product:" in text_low or "columns:" in text_low or "section:" in text_low) else 0
+        return (distinct_hits + phrase_hits * 2, phrase_hits, is_row)
+
     def search_with_status(
         self,
         query: str,
@@ -636,10 +746,11 @@ class DocumentStore:
         source_filter: str | None = None
     ) -> tuple[list[DocChunk], float, str | None]:
         """
-        Executes search:
-        - Prioritizes EmbeddingGemma 2 dense vector retrieval if chunk embeddings are present.
-        - Falls back gracefully to BM25 search if embeddings are not generated or if query embedding fails.
-        - Distinguishes between genuine absence of information vs retrieval failure.
+        Executes hybrid search:
+        - Prioritizes EmbeddingGemma 2 dense vector retrieval + word-boundary keyword reranking.
+        - If a specific item/entity question has zero whole-word topic matches across the entire
+          filtered document, treats similarity as below threshold to prevent false retrieval.
+        - Falls back gracefully to BM25 search if embeddings fail.
         """
         if not self.chunks:
             return [], 0.0, None
@@ -650,15 +761,38 @@ class DocumentStore:
             if not candidates:
                 return [], 0.0, None
 
+        topic_tokens = self._extract_topic_tokens(query)
+        expanded_tokens = [t for t in expand_query_terms(query, history=None) if len(t) >= 3 and t not in self._GENERIC_TOPIC_STOPWORDS]
+        check_tokens = list(dict.fromkeys(topic_tokens + expanded_tokens))
+
+        if check_tokens and len(topic_tokens) > 0:
+            total_topic_hits = sum(self._chunk_keyword_hits(c.text, check_tokens) for c in candidates)
+            if total_topic_hits == 0:
+                below_score = max(0.0, threshold - 0.10)
+                print(f"[Retrieval] No document match for topic tokens {topic_tokens} in '{source_filter or 'ALL'}' -> below threshold ({below_score:.3f} < {threshold})", flush=True)
+                return [], below_score, None
+
         # 1. Try vector search with EmbeddingGemma 2 if any candidate chunk has an embedding
         has_embeddings = any(c.embedding is not None and len(c.embedding) > 0 for c in candidates)
         if has_embeddings:
             q_embs, q_err = generate_embeddings([query])
             if q_embs and len(q_embs) > 0:
-                rel_chunks, best_sim, v_err = self.vector_search(
-                    q_embs[0], k=k, threshold=0.30, source_filter=source_filter
+                fetch_n = len(candidates) if check_tokens else k
+                rel_pairs, best_sim, v_err = self.vector_search(
+                    q_embs[0], k=fetch_n, threshold=threshold, source_filter=source_filter, return_scores=True
                 )
                 if not v_err:
+                    if check_tokens and rel_pairs:
+                        rel_pairs = sorted(
+                            rel_pairs,
+                            key=lambda pair: (self._chunk_rerank_score(pair[0].text, query, check_tokens), pair[1]),
+                            reverse=True,
+                        )[:k]
+                    else:
+                        rel_pairs = rel_pairs[:k]
+                    for chunk, sc in rel_pairs:
+                        print(f"[Retrieval] Chunk: {chunk.source} (page {chunk.page + 1}) | similarity={sc:.4f}", flush=True)
+                    rel_chunks = [chunk for chunk, _ in rel_pairs]
                     return rel_chunks, best_sim, None
             elif q_err:
                 print(f"[Retrieval] EmbeddingGemma 2 query embedding notice: {q_err}. Falling back to BM25.")
@@ -724,7 +858,11 @@ class DocumentStore:
             best_score = scores[0][0] if scores else 0.0
 
             # Filter by relevance threshold
-            relevant = [item[1] for item in scores if item[0] >= threshold][:k]
+            relevant_pairs = [(item[1], float(item[0])) for item in scores if item[0] >= threshold][:k]
+            log_pairs = relevant_pairs if relevant_pairs else [(item[1], float(item[0])) for item in scores[:min(2, len(scores))]]
+            for chunk, sc in log_pairs:
+                print(f"[Retrieval BM25] Chunk: {chunk.source} (page {chunk.page + 1}) | score={sc:.4f}", flush=True)
+            relevant = [chunk for chunk, _ in relevant_pairs]
             return relevant, best_score, None
 
         except Exception as e:
@@ -759,11 +897,11 @@ def add_conversation_turn(user_msg: str, assistant_msg: str, lang: str):
 
 
 def get_text_splitter():
-    """Create chunk splitter configured for fast CPU SLM RAG (~300-400 tokens, ~1200-1400 chars)."""
+    """Create chunk splitter configured for fast CPU SLM RAG using CHUNK_SIZE from .env."""
     chunk_tokens = get_chunk_size()
     overlap_tokens = get_chunk_overlap()
-    chunk_chars = max(300, chunk_tokens * 4)
-    overlap_chars = max(40, overlap_tokens * 4)
+    chunk_chars = max(100, chunk_tokens * 4)
+    overlap_chars = max(10, overlap_tokens * 4)
     if RecursiveCharacterTextSplitter:
         return RecursiveCharacterTextSplitter(
             chunk_size=chunk_chars,
@@ -778,14 +916,267 @@ def get_text_splitter():
             while start < len(text):
                 end = min(start + chunk_chars, len(text))
                 chunks.append(text[start:end])
-                start += max(100, chunk_chars - overlap_chars)
+                start += max(10, chunk_chars - overlap_chars)
             return chunks
     return FallbackSplitter()
 
 
-def process_document(file_path: str) -> int:
+def _split_table_columns(line: str) -> list[str]:
+    """Split a table-like line into columns by pipe, tab, or 2+ spaces."""
+    s = line.strip()
+    if not s:
+        return []
+    if "|" in s:
+        parts = [p.strip() for p in s.split("|")]
+        if s.startswith("|") and parts and parts[0] == "":
+            parts = parts[1:]
+        if s.endswith("|") and parts and parts[-1] == "":
+            parts = parts[:-1]
+        return [p for p in parts if p]
+    if "\t" in s:
+        return [p.strip() for p in re.split(r"\t+", s) if p.strip()]
+    return [p.strip() for p in re.split(r"\s{2,}", s) if p.strip()]
+
+
+def _get_column_offsets(raw_line: str, cols: list[str]) -> list[int]:
+    """Find character start offsets of each column in a space-aligned layout line."""
+    offsets = []
+    pos = 0
+    for col in cols:
+        idx = raw_line.find(col, pos)
+        if idx == -1:
+            idx = pos
+        offsets.append(idx)
+        pos = idx + len(col)
+    return offsets
+
+
+def _is_section_heading(stripped: str) -> bool:
     """
-    Extract text from PDF or TXT, split into overlapping chunks, and index.
+    Detect generic section headings:
+    - Lines starting with a number and a title (e.g., '1. About the Shop')
+    - Lines in ALL CAPS (with >= 3 letters)
+    - Lines ending with a colon (e.g., 'Current Offers:')
+    """
+    if not stripped or len(stripped) > 90:
+        return False
+    if re.match(r"^[-*•]\s+", stripped):
+        return False
+    if re.match(r"^(q|a)\s*:", stripped, re.IGNORECASE):
+        return False
+    # Avoid treating multi-column lines as headings
+    if len(_split_table_columns(stripped)) >= 2:
+        return False
+
+    # 1. Numbered heading (e.g., '1. About the Shop', '2.1 Pricing')
+    if re.match(r"^\d+(?:\.\d+)*[.)]\s+[A-Za-z\u0B80-\u0BFF]", stripped):
+        after_num = stripped.split(" ", 1)[1] if " " in stripped else ""
+        if not stripped.endswith(("?", ".")) and "(Answer:" not in stripped and "(Expected:" not in stripped and ". " not in after_num:
+            return True
+
+    # 2. ALL CAPS heading
+    alpha_count = sum(1 for c in stripped if c.isalpha())
+    if alpha_count >= 3 and stripped == stripped.upper() and not stripped.endswith("?"):
+        return True
+
+    # 3. Ends with a colon
+    if stripped.endswith(":") and len(stripped) >= 3:
+        return True
+
+    return False
+
+
+def _is_table_header(cols: list[str], stripped: str) -> bool:
+    """Detect column header lines generically without hardcoding column names."""
+    if len(cols) < 2:
+        return False
+    if any(re.search(r"\d", c) for c in cols):
+        return False
+    if any(len(c) > 35 for c in cols):
+        return False
+    if stripped.endswith((".", "?", "!")):
+        return False
+    return True
+
+
+def split_document_structured(pages_data: list[tuple[str, int]], splitter, filename: str) -> list[DocChunk]:
+    """
+    Generic structure-aware chunker:
+    - Splits by section headings and prefixes every chunk with 'Section: <title>'.
+    - Keeps each table/row-like line as its own chunk prefixed with section title and column headers.
+    - Splits remaining prose with the normal text splitter, keeping Q:/A: pairs together.
+    """
+    chunks: list[DocChunk] = []
+    current_section = ""
+    prose_lines: list[str] = []
+    prose_page = 0
+    table_headers: list[str] | None = None
+    header_offsets: list[int] | None = None
+    active_row_cols: list[str] | None = None
+    active_row_page = 0
+    blank_since_row = False
+
+    def flush_prose():
+        nonlocal prose_lines
+        if not prose_lines:
+            return
+        # Normalize prose lines, keeping Q: and A: together
+        normalized_blocks: list[str] = []
+        buf: list[str] = []
+        for ln in prose_lines:
+            if not ln:
+                if buf:
+                    normalized_blocks.append(" ".join(buf))
+                    buf = []
+            elif re.match(r"^q\s*:", ln, re.IGNORECASE):
+                if buf:
+                    normalized_blocks.append(" ".join(buf))
+                    buf = []
+                buf.append(ln)
+            elif re.match(r"^a\s*:", ln, re.IGNORECASE):
+                if buf:
+                    buf.append("\n" + ln)
+                else:
+                    buf.append(ln)
+            elif re.match(r"^[-*•]\s+", ln) or re.match(r"^\d+[.)]\s+", ln):
+                if buf:
+                    normalized_blocks.append(" ".join(buf))
+                    buf = []
+                buf.append(ln)
+            else:
+                buf.append(ln)
+        if buf:
+            normalized_blocks.append(" ".join(buf))
+
+        prose_text = "\n\n".join(b.strip() for b in normalized_blocks if b.strip())
+        if prose_text:
+            for st in splitter.split_text(prose_text):
+                clean = st.strip()
+                if clean:
+                    text_out = f"Section: {current_section}\n{clean}" if current_section else clean
+                    chunks.append(DocChunk(text=text_out, source=filename, page=prose_page))
+        prose_lines = []
+
+    def flush_row():
+        nonlocal active_row_cols
+        if not active_row_cols:
+            return
+        cleaned_cols = [c.strip() for c in active_row_cols if c.strip()]
+        if cleaned_cols:
+            if table_headers and len(cleaned_cols) == len(table_headers):
+                row_str = " | ".join(f"{h}: {v}" for h, v in zip(table_headers, cleaned_cols))
+            else:
+                row_str = " | ".join(cleaned_cols)
+            parts = []
+            if current_section:
+                parts.append(f"Section: {current_section}")
+            if table_headers:
+                parts.append(f"Columns: {' | '.join(table_headers)}")
+            parts.append(row_str)
+            chunks.append(DocChunk(text="\n".join(parts), source=filename, page=active_row_page))
+        active_row_cols = None
+
+    for page_text, page_num in pages_data:
+        for raw_line in page_text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                if active_row_cols is not None:
+                    blank_since_row = True
+                elif prose_lines and prose_lines[-1] != "":
+                    prose_lines.append("")
+                continue
+
+            # Skip markdown divider lines (e.g. |---|---|)
+            if re.match(r"^[\|\-\+\=\s:]+$", stripped):
+                continue
+
+            # Check if previous section heading had an unclosed parenthesis
+            if current_section and current_section.count("(") > current_section.count(")") and len(stripped) <= 40:
+                current_section = f"{current_section} {stripped}".strip()
+                continue
+
+            cols = _split_table_columns(raw_line)
+            pipe_count = stripped.count("|")
+            tab_count = len(re.findall(r"\t+", stripped))
+            multispace_count = len(re.findall(r"\s{2,}", stripped))
+            has_2plus_seps = (pipe_count >= 2) or (tab_count >= 2) or (multispace_count >= 2)
+            has_any_sep = (pipe_count >= 1) or (tab_count >= 1) or (multispace_count >= 1)
+
+            # Check continuation line for an active multi-column table row (no blank line before it)
+            is_bullet_or_qa = bool(re.match(r"^([-*•]\s+|(q|a)\s*:|\d+[.)]\s+)", stripped, re.IGNORECASE))
+            if (
+                active_row_cols is not None
+                and len(active_row_cols) >= 2
+                and not blank_since_row
+                and not has_2plus_seps
+                and not is_bullet_or_qa
+                and not _is_section_heading(stripped)
+            ):
+                if header_offsets and len(active_row_cols) == len(header_offsets):
+                    indent = len(raw_line) - len(raw_line.lstrip())
+                    col_idx = min(range(len(header_offsets)), key=lambda i: abs(header_offsets[i] - indent))
+                    active_row_cols[col_idx] = f"{active_row_cols[col_idx]} {stripped}".strip()
+                else:
+                    active_row_cols[-1] = f"{active_row_cols[-1]} {stripped}".strip()
+                continue
+
+            # Close any open row before handling a new line
+            flush_row()
+
+            # 1. Section heading
+            if _is_section_heading(stripped):
+                flush_prose()
+                table_headers = None
+                header_offsets = None
+                current_section = stripped
+                continue
+
+            # 2. Table header line
+            if has_any_sep and _is_table_header(cols, stripped):
+                flush_prose()
+                table_headers = cols
+                header_offsets = _get_column_offsets(raw_line, cols) if ("|" not in stripped and "\t" not in stripped) else None
+                continue
+
+            # 3. Table-like or row-like line
+            in_prose_paragraph = bool(prose_lines and prose_lines[-1] != "")
+            has_price_or_num_pattern = bool(
+                re.search(r"(?:Rs\.?|INR|₹|\$|€|£)\s*\d|\b\d[\d,]*\s*-\s*\d[\d,]*\b", stripped, re.IGNORECASE)
+            )
+            is_row_line = False
+            if not is_bullet_or_qa:
+                if has_2plus_seps:
+                    is_row_line = True
+                elif table_headers is not None and has_any_sep:
+                    is_row_line = True
+                elif not in_prose_paragraph and has_price_or_num_pattern and len(stripped) <= 140 and not re.search(r"[.?!]\s+[A-Z]", stripped):
+                    is_row_line = True
+
+            if is_row_line:
+                flush_prose()
+                active_row_cols = cols if len(cols) >= 2 else [stripped]
+                active_row_page = page_num
+                blank_since_row = False
+                continue
+
+            # 4. Regular prose line
+            if table_headers is not None and not has_any_sep:
+                # Prose resumed after table
+                table_headers = None
+                header_offsets = None
+            if not prose_lines:
+                prose_page = page_num
+            prose_lines.append(stripped)
+
+    flush_row()
+    flush_prose()
+    return chunks
+
+
+def process_document(file_path: str, replace_existing: bool = True) -> int:
+    """
+    Extract text from PDF or TXT, split into structure-aware chunks, and index.
+    By default, uploading a new document replaces previous documents unless replace_existing=False.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -799,7 +1190,10 @@ def process_document(file_path: str) -> int:
             try:
                 reader = PdfReader(file_path)
                 for page_idx, page in enumerate(reader.pages):
-                    page_text = page.extract_text() or ""
+                    try:
+                        page_text = page.extract_text(extraction_mode="layout") or ""
+                    except TypeError:
+                        page_text = page.extract_text() or ""
                     if page_text.strip():
                         pages_data.append((page_text, page_idx))
             except Exception as e:
@@ -834,24 +1228,23 @@ def process_document(file_path: str) -> int:
         )
 
     splitter = get_text_splitter()
-    new_chunks = []
-
-    for text, page_num in pages_data:
-        sub_texts = splitter.split_text(text)
-        for st in sub_texts:
-            clean = st.strip()
-            if clean:
-                new_chunks.append(DocChunk(text=clean, source=filename, page=page_num))
+    new_chunks = split_document_structured(pages_data, splitter, filename)
 
     # Check if identical document is already indexed to avoid re-embedding unchanged documents
     clean_name = os.path.basename(filename)
     existing_chunks = [c for c in _store.chunks if c.source == clean_name and c.embedding is not None]
     if existing_chunks and len(existing_chunks) == len(new_chunks):
         if all(c.text == e.text for c, e in zip(new_chunks, existing_chunks)):
-            print(f"[Store] Reusing existing EmbeddingGemma 2 embeddings for unchanged document '{clean_name}'.")
+            if replace_existing:
+                _store.add_chunks(clean_name, existing_chunks, replace_existing=True)
+            else:
+                _store.last_uploaded_doc = clean_name
+                _store.save()
+            clear_query_cache()
+            print(f"[Store] Reusing existing embeddings for unchanged document '{clean_name}'. Indexed documents: {list(_store.file_registry.keys())}", flush=True)
             return len(existing_chunks)
 
-    # Generate embeddings using EmbeddingGemma 2 via Ollama
+    # Generate embeddings using configured Ollama embedding model
     texts = [c.text for c in new_chunks]
     embs, emb_err = generate_embeddings(texts)
     if embs and len(embs) == len(new_chunks):
@@ -861,31 +1254,47 @@ def process_document(file_path: str) -> int:
     elif emb_err:
         print(f"[Store Warning] Embedding generation failed ({emb_err}). Storing text chunks for BM25 fallback.")
 
-    _store.add_chunks(clean_name, new_chunks)
+    _store.add_chunks(clean_name, new_chunks, replace_existing=replace_existing)
     clear_query_cache()
-    print(f"Indexed {len(new_chunks)} chunks for '{clean_name}'")
+    print(f"Indexed {len(new_chunks)} chunks for '{clean_name}'. Indexed documents: {list(_store.file_registry.keys())}", flush=True)
     return len(new_chunks)
 
 
 _last_invocation_error = {"ollama": None, "groq": None}
+_ollama_status_cache = {"result": None, "timestamp": 0.0}
+_STATUS_CACHE_TTL = 30.0
 
 
-def check_ollama_status() -> dict:
-    """Ping Ollama API to verify availability and list installed models."""
+def check_ollama_status(force: bool = False) -> dict:
+    """Ping Ollama API to verify availability and list installed models (cached for 30s)."""
+    now = time.time()
+    if not force and _ollama_status_cache["result"] is not None:
+        if (now - _ollama_status_cache["timestamp"]) < _STATUS_CACHE_TTL:
+            return _ollama_status_cache["result"]
+
     base_url = get_ollama_base_url()
     try:
         req = urllib.request.Request(f"{base_url}/api/tags", headers={"User-Agent": "RAG-Chatbot"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
             models = [m.get("name", "") for m in data.get("models", [])]
-            return {"online": True, "models": models, "error": None}
+            res = {"online": True, "models": models, "error": None}
+            _ollama_status_cache["result"] = res
+            _ollama_status_cache["timestamp"] = now
+            return res
     except urllib.error.URLError as e:
         err_msg = str(e.reason) if hasattr(e, "reason") else str(e)
         print(f"[Ollama] Connection failed ({base_url}): {err_msg}")
-        return {"online": False, "models": [], "error": err_msg}
+        res = {"online": False, "models": [], "error": err_msg}
+        _ollama_status_cache["result"] = res
+        _ollama_status_cache["timestamp"] = now
+        return res
     except Exception as e:
         print(f"[Ollama] Unexpected error checking status: {e}")
-        return {"online": False, "models": [], "error": str(e)}
+        res = {"online": False, "models": [], "error": str(e)}
+        _ollama_status_cache["result"] = res
+        _ollama_status_cache["timestamp"] = now
+        return res
 
 
 def get_active_model(status: dict | None = None) -> tuple[str, bool]:
@@ -899,14 +1308,16 @@ def get_active_model(status: dict | None = None) -> tuple[str, bool]:
     if not status["online"] or not status["models"]:
         return configured, False
 
-    for m in status["models"]:
-        if m == configured or m.startswith(f"{configured}:") or configured.startswith(f"{m}:"):
-            return m, True
+    if configured:
+        for m in status["models"]:
+            if m == configured or m.startswith(f"{configured}:") or configured.startswith(f"{m}:"):
+                return m, True
+        print(f"[Ollama WARNING] Configured MODEL_NAME='{configured}' not found in installed models {status['models']}. "
+              f"Falling back to: {status['models'][0]}")
+    else:
+        print(f"[Ollama WARNING] MODEL_NAME is not set in .env. Falling back to: {status['models'][0]}")
 
-    fallback = status["models"][0]
-    print(f"[Ollama] Configured model '{configured}' not found in installed models {status['models']}. "
-          f"Falling back to: {fallback}")
-    return fallback, True
+    return status["models"][0], True
 
 
 # ---------------------------------------------------------------------------
@@ -916,22 +1327,46 @@ def get_active_model(status: dict | None = None) -> tuple[str, bool]:
 def get_language_system_line(lang: str) -> str:
     """Explicit instruction line placed at the top of the system prompt."""
     if lang == "Tanglish":
-        return "Reply ONLY in Tanglish (Tamil spoken language written in English letters). Do NOT reply in English sentences. Keep product names and prices unchanged."
+        return "Reply ONLY in Tanglish (Tamil spoken language written in English letters). Do NOT reply in English sentences. Keep item names, numbers, and prices unchanged."
     elif lang == "Tamil":
-        return "Reply ONLY in Tamil script."
+        return "Reply ONLY in Tamil script. Keep item names, numbers, and prices unchanged."
     return "Reply ONLY in English."
 
 
-def get_slm_rag_prompt(lang: str = "English") -> str:
+def get_missing_info_response(query: str, lang: str = "English") -> str:
+    """Generic fallback message when requested detail is missing from documents."""
+    norm = (lang or "english").strip().lower()
+    if norm in ("tanglish", "thanglish"):
+        return "Intha detail ennoda documents la illa. Owner kitta kelunga."
+    elif norm == "tamil":
+        return "\u0b87\u0ba8\u0bcd\u0ba4 \u0bb5\u0bbf\u0bb5\u0bb0\u0bae\u0bcd \u0b95\u0bbf\u0b9f\u0bc8\u0b95\u0bcd\u0b95\u0bb5\u0bbf\u0bb2\u0bcd\u0bb2\u0bc8. \u0ba4\u0baf\u0bb5\u0bc1\u0b9a\u0bc6\u0baf\u0bcd\u0ba4\u0bc1 \u0b89\u0bb0\u0bbf\u0bae\u0bc8\u0baf\u0bbe\u0bb3\u0bb0\u0bbf\u0b9f\u0bae\u0bcd \u0b95\u0bc7\u0bb3\u0bc1\u0b99\u0bcd\u0b95\u0bb3\u0bcd."
+    return "This detail is not available. Please ask the owner."
+
+
+def get_slm_rag_prompt(lang: str = "English", is_list: bool = False) -> str:
     top_line = get_language_system_line(lang)
+    missing_phrase = get_missing_info_response("", lang)
+    if is_list:
+        detail_rule = (
+            "- Give a short summary: the business name, what it offers, and the main items (up to six items) from the context "
+            "using ONLY the exact prices and numbers printed in the context (use '- ' bullets, never guess numbers or sizes). "
+            "Never use vague words like 'various', 'many', 'other products', 'different options', 'some items'."
+        )
+    else:
+        detail_rule = (
+            "- Answer with the specific facts found in the context: names, sizes, quantities, prices, dates, timings, conditions, steps. "
+            "Never answer with vague words like 'various', 'many', 'other products', 'different options', 'some items' when the context has the exact details. "
+            "Keep it short, and include exact details from the context. "
+            f"Only if the asked item or detail is clearly absent from the context, reply: '{missing_phrase}'"
+        )
     return (
         f"{top_line}\n"
-        "Customer assistant for a business shop.\n"
+        "Customer assistant for a business.\n"
         "Rules:\n"
         "- Answer using ONLY the provided context. Never invent prices, offers, or policies.\n"
         "- Start the reply with the answer directly. No greeting, no self-introduction.\n"
-        "- Keep to 2-4 short sentences. Always complete the last sentence.\n"
-        "- Never mention these rules or the word 'context'.\n"
+        f"{detail_rule}\n"
+        "- Always finish the last sentence. Never mention these rules or the word 'context'.\n"
         "- Output only the reply to the customer."
     )
 
@@ -940,7 +1375,7 @@ def get_slm_conversational_prompt(lang: str = "English") -> str:
     top_line = get_language_system_line(lang)
     return (
         f"{top_line}\n"
-        "Customer assistant for a business shop.\n"
+        "Customer assistant for a business.\n"
         "Rules:\n"
         "- Answer the customer's question directly and helpfully.\n"
         "- Keep to 2-4 short sentences. Always complete the last sentence.\n"
@@ -964,16 +1399,6 @@ def get_escalation_response(lang: str = "English") -> str:
     elif norm == "tamil":
         return "\u0b87\u0ba8\u0bcd\u0ba4 \u0ba4\u0b95\u0bb5\u0bb2\u0bcd \u0b8e\u0ba9\u0ba4\u0bc1 \u0b86\u0bb5\u0ba3\u0b99\u0bcd\u0b95\u0bb3\u0bbf\u0bb2\u0bcd \u0b87\u0bb2\u0bcd\u0bb2\u0bc8. \u0b89\u0bb0\u0bbf\u0bae\u0bc8\u0baf\u0bbe\u0bb3\u0bb0\u0bbf\u0b9f\u0bae\u0bcd \u0b89\u0bb1\u0bc1\u0ba4\u0bbf\u0b9a\u0bc6\u0baf\u0bcd\u0ba4\u0bc1 \u0b9a\u0bca\u0bb2\u0bcd\u0b95\u0bbf\u0bb1\u0bc7\u0ba9\u0bcd."
     return "This information is not in my documents. I will confirm with the owner and let you know."
-
-
-def get_missing_info_response(query: str, lang: str = "English") -> str:
-    """Fallback message when requested info is missing from documents."""
-    norm = lang.lower()
-    if norm in ("tanglish", "thanglish"):
-        return "Intha information ennoda documents la illa. Sariyana details kelunga."
-    elif norm == "tamil":
-        return "\u0b87\u0ba8\u0bcd\u0ba4 \u0ba4\u0b95\u0bb5\u0bb2\u0bcd \u0b86\u0bb5\u0ba3\u0b99\u0bcd\u0b95\u0bb3\u0bbf\u0bb2\u0bcd \u0b87\u0bb2\u0bcd\u0bb2\u0bc8. \u0ba4\u0baf\u0bb5\u0bc1\u0b9a\u0bc6\u0baf\u0bcd\u0ba4\u0bc1 \u0b95\u0bc2\u0b9f\u0bc1\u0ba4\u0bb2\u0bcd \u0bb5\u0bbf\u0bb5\u0bb0\u0b99\u0bcd\u0b95\u0bb3\u0bc8 \u0bb5\u0bb4\u0b99\u0bcd\u0b95\u0bb5\u0bc1\u0bae\u0bcd."
-    return "This information is not available in the documents. Please ask with more details."
 
 
 def get_retrieval_error_response(lang: str = "English") -> str:
@@ -1201,7 +1626,7 @@ BUSINESS_PATTERNS = [
     r"\b(availability|available|in stock|out of stock|stock|stocks)\b",
     r"\b(order|orders|ordering|buy|purchase|cart)\b",
     r"\b(product|products|item|items|catalog|catalogue|menu)\b",
-    r"\b(warranty|guarantee|herbal|soap|oil|powder|tea|moringa|triphala|neem)\b",
+    r"\b(warranty|guarantee)\b",
     r"\b(payment|upi|gpay|cod|cash on delivery)\b",
     # Tanglish keywords
     r"\b(vilai|vila|rate-u|rateu|evvalavu|evalo|ethana|panam|kaasu|kassu)\b",
@@ -1218,18 +1643,6 @@ def is_business_question(query: str) -> bool:
     """Detect whether the query is related to business matters (pricing, products, orders, timings, etc.)."""
     q = query.lower()
     return any(re.search(pat, q) for pat in BUSINESS_PATTERNS)
-
-
-def get_missing_info_response(query: str, lang: str = "english") -> str:
-    """
-    Polite response when information cannot be found in the current documentation.
-    Meets Requirement 2 with dynamic language and style matching.
-    """
-    if lang == "tamil":
-        return "கிடைக்கக்கூடிய project documentation-ல் அந்தத் தகவல் கிடைக்கவில்லை. சம்பந்தப்பட்ட document-ஐ upload செய்யுங்கள் அல்லது கூடுதல் விவரங்களைத் தாருங்கள்."
-    elif lang == "thanglish":
-        return "Available project documentation-la andha information kidaikkala bro. Relevant document-a upload pannunga illa konjam details share pannunga."
-    return "I couldn't find that information in the available project documentation. Please upload the relevant document or provide more details."
 
 
 def get_retrieval_error_response(lang: str = "english") -> str:
@@ -1278,9 +1691,9 @@ def clean_model_output(text: str, target_lang: str) -> str:
 # Ollama and Groq Invocation
 # ---------------------------------------------------------------------------
 
-def _invoke_ollama(prompt: str, system: str | None = None) -> tuple[str | None, str | None]:
+def _invoke_ollama(prompt: str, system: str | None = None, num_predict: int | None = None) -> tuple[str | None, str | None]:
     """
-    Invoke Ollama with automatic model detection, keep_alive=60m, system prompt support,
+    Invoke Ollama with automatic model detection, keep_alive, system prompt support,
     and graceful fallbacks. Returns (response_text, error_message).
     """
     global _last_invocation_error
@@ -1305,6 +1718,8 @@ def _invoke_ollama(prompt: str, system: str | None = None) -> tuple[str | None, 
         _last_invocation_error["ollama"] = err
         return None, err
 
+    predict_limit = num_predict if num_predict is not None else get_num_predict()
+
     # 1. Direct HTTP call to Ollama /api/generate
     try:
         url = f"{base_url}/api/generate"
@@ -1315,7 +1730,7 @@ def _invoke_ollama(prompt: str, system: str | None = None) -> tuple[str | None, 
             "keep_alive": get_keep_alive(),
             "options": {
                 "num_ctx": get_num_ctx(),
-                "num_predict": get_num_predict(),
+                "num_predict": predict_limit,
                 "temperature": get_temperature()
             }
         }
@@ -1327,7 +1742,7 @@ def _invoke_ollama(prompt: str, system: str | None = None) -> tuple[str | None, 
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "User-Agent": "RAG-Chatbot"}
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=get_ollama_timeout()) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             res = data.get("response", "").strip()
             if res:
@@ -1353,9 +1768,9 @@ def _invoke_ollama(prompt: str, system: str | None = None) -> tuple[str | None, 
             llm = OllamaLLM(
                 model=model,
                 base_url=base_url,
-                sync_client_kwargs={"timeout": 120},
+                sync_client_kwargs={"timeout": get_ollama_timeout()},
                 num_ctx=get_num_ctx(),
-                num_predict=get_num_predict(),
+                num_predict=predict_limit,
                 temperature=get_temperature(),
                 keep_alive=get_keep_alive()
             )
@@ -1368,16 +1783,19 @@ def _invoke_ollama(prompt: str, system: str | None = None) -> tuple[str | None, 
     return None, _last_invocation_error["ollama"]
 
 
-def _stream_ollama(prompt: str, system: str | None = None):
+def _stream_ollama(prompt: str, system: str | None = None, num_predict: int | None = None):
     """Stream tokens directly from Ollama /api/generate line-by-line."""
     base_url = get_ollama_base_url()
     status = check_ollama_status()
     if not status["online"] or not status["models"]:
-        return
+        err_msg = status.get("error") or "Ollama is offline or no models available"
+        raise RuntimeError(err_msg)
 
     model, is_available = get_active_model(status)
     if not is_available:
-        return
+        raise RuntimeError(f"Configured model '{get_configured_model()}' is not available.")
+
+    predict_limit = num_predict if num_predict is not None else get_num_predict()
 
     url = f"{base_url}/api/generate"
     payload = {
@@ -1387,7 +1805,7 @@ def _stream_ollama(prompt: str, system: str | None = None):
         "keep_alive": get_keep_alive(),
         "options": {
             "num_ctx": get_num_ctx(),
-            "num_predict": get_num_predict(),
+            "num_predict": predict_limit,
             "temperature": get_temperature()
         }
     }
@@ -1399,15 +1817,20 @@ def _stream_ollama(prompt: str, system: str | None = None):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "RAG-Chatbot"}
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        for line in resp:
-            if line.strip():
-                item = json.loads(line.decode("utf-8"))
-                token = item.get("response", "")
-                if token:
-                    yield token
-                if item.get("done", False):
-                    break
+    timeout_val = get_ollama_timeout()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_val) as resp:
+            for line in resp:
+                if line.strip():
+                    item = json.loads(line.decode("utf-8"))
+                    token = item.get("response", "")
+                    if token:
+                        yield token
+                    if item.get("done", False):
+                        break
+    except Exception:
+        _ollama_status_cache["result"] = None
+        raise
 
 
 def _invoke_groq(prompt: str) -> tuple[str | None, str | None]:
@@ -1524,6 +1947,245 @@ def ensure_tanglish_reply(answer: str, detected_lang: str) -> tuple[str, bool]:
 # Main Question & Answering Pipeline
 # ---------------------------------------------------------------------------
 
+LIST_OVERVIEW_PHRASES = (
+    "what do you have", "what do you offer", "what do you sell",
+    "what is this about", "what is it about",
+    "tell me about your shop", "tell me about this", "tell me about your store", "tell me about your business",
+    "what products", "what services", "what items",
+    "un ta edhu pathi details irukku", "unta edhu pathi details irukku",
+    "edhu pathi details irukku", "enna details irukku",
+    "enna productslam irukku", "enna productlam irukku", "enna products lam irukku",
+    "productslam", "productlam", "products lam",
+    "enna irukku", "unga kita enna irukku", "unga kitta enna irukku",
+    "details sollu", "enna enna",
+)
+LIST_OVERVIEW_WORDS = {
+    "list", "types", "catalog", "catalogue", "menu", "all",
+    "available", "options", "sizes", "quantities", "varieties", "overview",
+}
+_OVERVIEW_FUZZY_TARGETS = (
+    "what do you have", "what is this about", "tell me about your shop",
+    "edhu pathi details irukku", "enna details irukku",
+    "enna productslam irukku", "unga kita enna irukku", "details sollu",
+)
+_UPLOAD_ACK_EXACT = {
+    "ok", "okay", "okk", "k", "kk", "done", "thanks", "thank you", "thx", "ty", "nandri",
+    "uploaded", "doc uploaded", "document uploaded", "file uploaded", "upload done",
+    "i have upload the doc", "i have uploaded the doc", "i uploaded the doc",
+    "i have uploaded the document", "i uploaded the document", "uploaded the doc",
+}
+
+
+_UPLOAD_ACK_WORDS = {
+    "ok", "okay", "okk", "k", "kk", "done", "thanks", "thank", "you", "thx", "ty", "nandri",
+    "uploaded", "upload", "got", "it", "alright", "fine", "cool", "sure", "seri", "doc", "document",
+}
+
+
+def is_upload_ack_message(query: str) -> bool:
+    """Detect non-question upload notifications and short acknowledgements (ok, done, thanks)."""
+    if not query or not query.strip():
+        return False
+    q_raw = query.strip()
+    q_norm = re.sub(r"[^\w\s]", "", q_raw.lower())
+    q_norm = re.sub(r"\s+", " ", q_norm).strip()
+    if q_norm in _UPLOAD_ACK_EXACT:
+        return True
+    words = q_norm.split()
+    if 1 <= len(words) <= 4 and all(w in _UPLOAD_ACK_WORDS for w in words):
+        return True
+    if "?" not in q_raw and ("upload" in q_norm or "uploaded" in q_norm):
+        if not is_business_question(q_norm) and not is_list_or_overview_question(q_norm):
+            return True
+    return False
+
+
+def get_upload_ack_reply(query: str) -> str:
+    """Short friendly acknowledgement in English or Tanglish without retrieval or fallback."""
+    lang_label = detect_reply_language(query)
+    q_low = (query or "").lower()
+    if lang_label in ("Tanglish", "Tamil") or any(w in q_low for w in ("nandri", "panniten", "aachu", "ayiduchu", "seri")):
+        return "Document vandhuduchu. Edhu venum nalum kelunga."
+    return "Document received. You can ask me anything about it."
+
+
+def is_list_or_overview_question(query: str) -> bool:
+    """Detect list or overview intent using English/Tanglish phrases, keywords, and fuzzy matching."""
+    if not query or not query.strip():
+        return False
+    q_lower = re.sub(r"\s+", " ", query.strip().lower())
+    if is_about_question(q_lower):
+        return True
+    if any(phrase in q_lower for phrase in LIST_OVERVIEW_PHRASES):
+        return True
+    words = re.findall(r"\b[a-zA-Z0-9]+\b", q_lower)
+    word_set = set(words)
+    if word_set & LIST_OVERVIEW_WORDS:
+        return True
+    # Small-typo fuzzy matching on overview words/phrases
+    for w in words:
+        if len(w) >= 6 and difflib.get_close_matches(w, ["productslam", "productlam", "products", "catalog", "catalogue", "overview", "varieties"], n=1, cutoff=0.80):
+            return True
+    for target in _OVERVIEW_FUZZY_TARGETS:
+        if difflib.SequenceMatcher(None, q_lower, target).ratio() >= 0.80:
+            return True
+    return False
+
+
+def resolve_active_document(selected_doc: str | None = None) -> str | None:
+    """Return the active document filename: explicit selection if valid, else most recently uploaded."""
+    if selected_doc:
+        clean_sel = os.path.basename(selected_doc)
+        if clean_sel in _store.file_registry:
+            return clean_sel
+    if _store.last_uploaded_doc and _store.last_uploaded_doc in _store.file_registry:
+        return _store.last_uploaded_doc
+    if _store.file_registry:
+        return list(_store.file_registry.keys())[-1]
+    return None
+
+
+def get_overview_chunks(active_doc: str | None = None, top_k: int = 4) -> list[DocChunk]:
+    """Retrieve chunks from the beginning of the active document (title, about, key catalog items)."""
+    candidates = _store.chunks
+    if active_doc:
+        candidates = [c for c in candidates if c.source == active_doc]
+    if not candidates:
+        return []
+    opening = candidates[:2]
+    catalog = [c for c in candidates[2:] if "Columns:" in (c.text or "")]
+    # Take first several catalog rows directly from the top of the catalog plus diverse picks
+    sampled_catalog = catalog[:5]
+    combined: list[DocChunk] = []
+    seen = set()
+    limit = max(top_k + 3, 7)
+    for c in opening + sampled_catalog + candidates:
+        cid = (c.source, c.page, c.text)
+        if cid not in seen:
+            seen.add(cid)
+            combined.append(c)
+        if len(combined) >= limit:
+            break
+    for c in combined:
+        print(f"[Retrieval Overview] Chunk: {c.source} (page {c.page + 1}) | score=1.0000", flush=True)
+    return combined
+
+
+def format_overview_chunks(chunks: list, max_total_chars: int = 2000) -> str:
+    """Compact overview context deduplicating repeated table headers so diverse items + prices fit cleanly."""
+    parts = []
+    seen_headers = set()
+    total_len = 0
+    for c in chunks:
+        lines = (c.text or "").splitlines()
+        cleaned_lines = []
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith("Section:") or s.startswith("Columns:"):
+                if s in seen_headers:
+                    continue
+                seen_headers.add(s)
+            cleaned_lines.append(ln)
+        body = "\n".join(cleaned_lines).strip()[:600]
+        if not body:
+            continue
+        if not parts:
+            part = f"[Source: {c.source} | Page: {c.page + 1}]\n{body}"
+        else:
+            part = body
+        if total_len + len(part) > max_total_chars:
+            break
+        parts.append(part)
+        total_len += len(part)
+    return "\n\n".join(parts)
+
+
+def check_number_groundedness(reply: str, context_text: str) -> tuple[bool, list[str]]:
+    """
+    Verify without an extra LLM call that every number (price, size, quantity)
+    in the reply exists in the retrieved context text.
+    """
+    if not reply or not reply.strip():
+        return True, []
+    # Ignore ordered bullet markers at line starts like "1. Cotton Saree"
+    reply_for_check = re.sub(r"(?m)^\s*\d+\.\s+(?=[A-Za-z\u0B80-\u0BFF])", "", reply)
+    num_pat = r"(?<![A-Za-z])\d+(?:,\d{3})*(?:\.\d+)?|(?<![A-Za-z])\d+(?:\.\d+)?"
+    reply_nums = re.findall(num_pat, reply_for_check)
+    if not reply_nums:
+        return True, []
+    ctx_nums = re.findall(num_pat, context_text or "")
+    ctx_norm = set()
+    for cn in ctx_nums:
+        stripped = cn.replace(",", "")
+        ctx_norm.add(stripped)
+        if "." in stripped:
+            try:
+                fval = float(stripped)
+                if fval.is_integer():
+                    ctx_norm.add(str(int(fval)))
+            except ValueError:
+                pass
+    unverified = []
+    for rn in reply_nums:
+        rn_stripped = rn.replace(",", "")
+        if rn_stripped in ctx_norm:
+            continue
+        matched_float = False
+        if "." in rn_stripped:
+            try:
+                fval = float(rn_stripped)
+                if fval.is_integer() and str(int(fval)) in ctx_norm:
+                    matched_float = True
+            except ValueError:
+                pass
+        if not matched_float:
+            unverified.append(rn)
+    return (len(unverified) == 0), unverified
+
+
+def build_retrieval_query(question: str, history: list[dict] | None = None) -> str:
+    """
+    For short follow-up questions WITHOUT a topic (< 6 words and no specific topic words,
+    e.g. 'how much', 'price?', 'sizes?'), prepend the last user turn from history.
+    Questions with their own topic (e.g. 'silk saree rate enna', 'aloe vera gel irukka')
+    keep their own query clean so prior topics do not pollute retrieval.
+    """
+    q_clean = (question or "").strip()
+    if is_list_or_overview_question(q_clean) and len(q_clean.split()) <= 5:
+        return f"{q_clean} products items services menu catalog"
+    has_own_topic = len(DocumentStore._extract_topic_tokens(q_clean)) > 0
+    if not has_own_topic and len(q_clean.split()) < 6 and isinstance(history, list) and history:
+        for turn in reversed(history):
+            if isinstance(turn, dict) and turn.get("role") == "user":
+                prev_q = str(turn.get("content") or "").strip()
+                if prev_q and prev_q.lower() != q_clean.lower():
+                    return f"{prev_q} {q_clean}"
+    return q_clean
+
+
+def select_list_chunks(chunks: list[DocChunk], top_k: int) -> list[DocChunk]:
+    """For list/overview queries, prefer table/row chunks ('Columns:') and intro chunks over disclaimers."""
+    if not chunks:
+        return []
+    preferred = [c for c in chunks if "Columns:" in c.text]
+    others = [c for c in chunks if "Columns:" not in c.text]
+    return (preferred + others)[:top_k]
+
+
+def format_context_chunks(chunks: list, max_total_chars: int = 1400) -> str:
+    """Format retrieved chunks: max 700 chars per chunk, capped at max_total_chars total."""
+    parts = []
+    total_len = 0
+    for c in chunks:
+        chunk_body = (c.text or "")[:700]
+        part = f"[Source: {c.source} | Page: {c.page + 1}]\n{chunk_body}"
+        parts.append(part)
+        total_len += len(part)
+        if total_len >= max_total_chars:
+            break
+    return "\n\n---\n\n".join(parts)[:max_total_chars]
+
+
 def build_prompt_with_context(
     question: str,
     context_text: str,
@@ -1531,42 +2193,70 @@ def build_prompt_with_context(
     history: list[dict] | None = None
 ) -> str:
     """
-    FIX 2: Constructs prompt with context, question, and trailing language instruction.
-    Removes topic-specific few-shot examples so model never copies them.
-    Places instruction at the END of user message for maximum model compliance.
+    Constructs prompt with context, last 2 history turns, question, and trailing language instruction.
+    Places language and specificity instructions at the END of user message for maximum compliance.
     """
     history_str = ""
-    if history:
+    has_standalone_topic = len(DocumentStore._extract_topic_tokens(question)) > 0 and len((question or "").split()) >= 2
+    if isinstance(history, list) and history and not has_standalone_topic:
         recent_turns = history[-2:]
         lines = []
         for turn in recent_turns:
+            if not isinstance(turn, dict):
+                continue
             role = "Customer" if turn.get("role") == "user" else "Assistant"
-            c = turn.get("content", "").replace("\n", " ").strip()
+            c = str(turn.get("content") or "").replace("\n", " ").strip()
+            c = c[:150]
             if c:
                 lines.append(f"{role}: {c}")
         if lines:
             history_str = "Recent Chat:\n" + "\n".join(lines) + "\n\n"
 
     reply_lang = detect_reply_language(question)
+    is_list_q = is_list_or_overview_question(question)
 
     if reply_lang == "Tanglish":
-        trailing_instruction = (
-            "Answer the question using only the context above. "
-            "Write the answer in Tanglish: Tamil spoken language written in English letters "
-            "(for example: 'Aama, irukku', 'Rs. 249 aagum', 'Trichy ku next day delivery'). "
-            "Do NOT write in English sentences. Keep product names and prices unchanged."
-        )
+        if is_list_q:
+            trailing_instruction = (
+                "Verified Context-la irukkura business name, enna offer panranga matrum key items-a (maximum six items) "
+                "context-la irukkura exact prices-oda '- ' bullets-la short-a sollunga. "
+                "New numbers ethuvum guess pannadhinga. Write in Tanglish without '|' symbols."
+            )
+        else:
+            trailing_instruction = (
+                "Answer ONLY the Customer Question directly in 1-2 short Tanglish sentences using ONLY the exact facts, "
+                "names, and numbers printed in Verified Context above (for example: 'Aama, irukku', 'Idhoda price ...'). "
+                "Never repeat the question. Do NOT copy '|' symbols. Do NOT write English sentences."
+            )
     elif reply_lang == "Tamil":
-        trailing_instruction = (
-            "Answer the question using only the context above in Tamil script. "
-            "Keep product names and prices unchanged."
-        )
+        if is_list_q:
+            trailing_instruction = (
+                "Verified Context-ல் உள்ள வணிக பெயர், சேவைகள் மற்றும் 4-6 முக்கிய பொருட்களை அவற்றின் விலை மற்றும் அளவுடன் '- ' புள்ளிகளில் சுருக்கமாகக் கூறவும்."
+            )
+        else:
+            trailing_instruction = (
+                "Answer the question directly from the Verified Context above in Tamil script with exact item names, sizes, prices, and details. "
+                "Keep item names, numbers, and prices unchanged."
+            )
     else:
-        trailing_instruction = "Answer in English."
+        if is_list_q:
+            trailing_instruction = (
+                "Give a short summary of the business name and what it offers, followed by up to six key items "
+                "from the Verified Context above with their exact prices and details using '- ' bullets. Copy only numbers shown in the context."
+            )
+        elif len(question.split()) < 4:
+            trailing_instruction = (
+                "Answer in English directly from the Verified Context above with exact names, sizes, prices, and details."
+            )
+        else:
+            trailing_instruction = (
+                "Answer ONLY the current Customer Question in English using ONLY the Verified Context above "
+                "with exact names, sizes, prices, and details. Ignore unrelated numbers from Recent Chat."
+            )
 
     return (
-        f"Verified Context:\n{context_text}\n\n"
         f"{history_str}"
+        f"Verified Context:\n{context_text}\n\n"
         f"Customer Question: {question}\n\n"
         f"{trailing_instruction}"
     )
@@ -1583,12 +2273,15 @@ def is_general_conversation(query: str) -> bool:
 def build_conversational_prompt(question: str, lang: str, history: list[dict] | None = None) -> str:
     """Constructs conversational prompt with trailing language instruction at the end."""
     history_str = ""
-    if history:
+    if isinstance(history, list) and history:
         recent_turns = history[-2:]
         lines = []
         for turn in recent_turns:
+            if not isinstance(turn, dict):
+                continue
             role = "Customer" if turn.get("role") == "user" else "Assistant"
-            c = turn.get("content", "").replace("\n", " ").strip()
+            c = str(turn.get("content") or "").replace("\n", " ").strip()
+            c = c[:150]
             if c:
                 lines.append(f"{role}: {c}")
         if lines:
@@ -1599,7 +2292,7 @@ def build_conversational_prompt(question: str, lang: str, history: list[dict] | 
     if reply_lang == "Tanglish":
         trailing_instruction = (
             "Write the answer in Tanglish: Tamil spoken language written in English letters "
-            "(for example: 'Aama, irukku', 'Rs. 249 aagum'). "
+            "(for example: 'Aama, irukku', 'Sollunga, enna help venum?'). "
             "Do NOT write in English sentences. Answer helpfully and concisely."
         )
     elif reply_lang == "Tamil":
@@ -1617,8 +2310,8 @@ def build_conversational_prompt(question: str, lang: str, history: list[dict] | 
 # ---------------------------------------------------------------------------
 
 def warmup_models():
-    """Warms up the embedding model and Gemma 3 once at startup with a dummy prompt."""
-    print("[Startup] Warming up AI models in RAM (keep_alive=30m)...")
+    """Warms up the configured embedding and generation models once at startup with a dummy prompt."""
+    print(f"[Startup] Warming up AI models in RAM (keep_alive={get_keep_alive()})...")
     t0 = time.perf_counter()
     # 1. Warm up embedding model
     try:
@@ -1649,11 +2342,13 @@ def warmup_models():
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=get_ollama_timeout()) as resp:
                 resp.read()
             print(f"[Startup] Models successfully warmed up in {time.perf_counter() - t0:.2f}s (RAM keep_alive={get_keep_alive()}).")
     except Exception as e:
         print(f"[Startup Warning] Model warmup notice: {e}")
+    active_m, _ = get_active_model()
+    print(f"[Startup] Ready | Model: {active_m or get_configured_model() or 'none'} | Embedding: {get_embedding_model_name() or 'none'} | Documents: {len(_store.file_registry)} ({_store.count()} chunks)", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1665,6 +2360,15 @@ def _safe_log_str(s: str) -> str:
     return s.encode("ascii", errors="backslashreplace").decode("ascii")
 
 
+def _is_explicit_escalation_query(query: str) -> bool:
+    """Detect explicit customer requests to speak with or complain to the owner."""
+    q = (query or "").lower()
+    return bool(re.search(
+        r"\b(complaint|refund|owner|manager|support|contact|call me|talk to|speak to|escalate)\b",
+        q
+    ))
+
+
 def ask_question(
     question: str,
     history: list[dict] | None = None,
@@ -1672,235 +2376,243 @@ def ask_question(
     selected_doc: str | None = None
 ) -> dict:
     """
-    Optimized RAG & Direct Response Pipeline:
-    - Stage 0: Instant Cache check (< 1 ms).
-    - CHANGE 1: Instant Greeting & Smalltalk without LLM/retrieval (< 100 ms).
-    - CHANGE 2: ChromaDB search & SIMILARITY_THRESHOLD routing without extra LLM call.
-      * score >= threshold -> 2-4 sentence grounded RAG answer from documents.
-      * score < threshold & business query -> 'Intha information ennoda documents la illa...', escalate=True.
-      * score < threshold & general query -> direct short LLM answer, escalate=False.
-    - CHANGE 3: Fast CPU execution (3-8 seconds) with timing logs.
+    Optimized RAG & Direct Response Pipeline with strict single-doc isolation,
+    upload-ack detection, overview summary routing, groundedness check, and route logging.
     """
     t_start = time.perf_counter()
-    q = question.strip()
-    if not q:
-        return {"answer": "Please enter a valid question.", "sources": [], "mode": "direct", "escalate": False}
+    try:
+        q = (question or "").strip()
+        if not q:
+            return {"answer": "Please enter a valid question.", "sources": [], "mode": "direct", "escalate": False}
 
-    # 1. Instant Greeting Check at the VERY START (no LLM, no retrieval, under 100ms)
-    greeting_reply = get_greeting_reply(q)
-    if greeting_reply:
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Query: '{_safe_log_str(q)}' | Stage: Greeting (Instant) | Total: {t_total*1000:.1f}ms")
-        res = {"answer": greeting_reply, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, greeting_reply, detect_language_style(q))
-        return res
+        active_doc = resolve_active_document(selected_doc)
+        doc_key = active_doc or ""
 
-    lang = detect_language_style(q)
+        # 1. Instant Greeting Check at the VERY START
+        greeting_reply = get_greeting_reply(q)
+        if greeting_reply:
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] greeting | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            res = {"answer": greeting_reply, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, res, doc_key=doc_key)
+            add_conversation_turn(q, greeting_reply, detect_language_style(q))
+            return res
 
-    # 1. In-memory cache check (< 1 ms)
-    cached = get_cached_response(q)
-    if cached is not None:
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Query: '{_safe_log_str(q)}' | Stage: Cache Hit | Total: {t_total*1000:.1f}ms")
-        return cached
+        # 2. Upload / Acknowledgement check (never trigger retrieval or fallback)
+        if is_upload_ack_message(q):
+            ack_reply = get_upload_ack_reply(q)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] upload-ack | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            res = {"answer": ack_reply, "sources": [], "mode": "direct", "escalate": False}
+            add_conversation_turn(q, ack_reply, detect_language_style(q))
+            return res
 
-    # 2. CHANGE 1: Greeting and small talk handled instantly without LLM or retrieval (< 100 ms)
-    is_st, st_reply, _ = classify_smalltalk(q)
-    if is_st:
-        res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, st_reply, lang)
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Query: '{_safe_log_str(q)}' | Stage: Rule-based Smalltalk | Total: {t_total*1000:.1f}ms")
-        return res
+        lang = detect_language_style(q)
 
-    # Identity check
-    if is_identity_question(q):
-        resp = get_identity_response(lang)
-        res = {"answer": resp, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, resp, lang)
-        return res
+        # 3. In-memory cache check (< 1 ms)
+        cached = get_cached_response(q, doc_key=doc_key)
+        if cached is not None:
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] {cached.get('route', 'rag-answer')} (cache) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            return cached
 
-    # About-question check: use doc to answer with business summary
-    if is_about_question(q) and _store.count() > 0:
-        raw_history = history if history is not None else get_conversation_history()
-        active_history = raw_history[-2:] if raw_history else []
-        top_k = get_top_k()
+        # 4. Smalltalk handled without LLM or retrieval
+        is_st, st_reply, _ = classify_smalltalk(q)
+        if is_st:
+            res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, res, doc_key=doc_key)
+            add_conversation_turn(q, st_reply, lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] greeting (smalltalk) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            return res
+
+        # 5. Identity check
+        if is_identity_question(q):
+            resp = get_identity_response(lang)
+            res = {"answer": resp, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, res, doc_key=doc_key)
+            add_conversation_turn(q, resp, lang)
+            print(f"[ROUTE] greeting (identity) | Query: '{_safe_log_str(q)}'", flush=True)
+            return res
+
+        raw_history = history if isinstance(history, list) else get_conversation_history()
+        active_history = raw_history[-2:] if isinstance(raw_history, list) and raw_history else []
+        chunk_count = _store.count()
+
+        # 6. Overview / List question -> retrieve from beginning + catalog chunks of active doc
+        if is_list_or_overview_question(q) and chunk_count > 0 and mode != "direct":
+            top_k_list = get_top_k_list()
+            t_ret_start = time.perf_counter()
+            overview_chunks = get_overview_chunks(active_doc, top_k=top_k_list)
+            t_retrieve = time.perf_counter() - t_ret_start
+            if overview_chunks:
+                sources = []
+                for c in overview_chunks:
+                    page_str = f" (page {c.page + 1})" if isinstance(c.page, int) and c.page >= 0 else ""
+                    label = f"{c.source}{page_str}"
+                    if label not in sources:
+                        sources.append(label)
+                context_text = format_overview_chunks(overview_chunks, max_total_chars=2000)
+                detected_lang = detect_reply_language(q)
+                sys_prompt = get_slm_rag_prompt(detected_lang, is_list=True)
+                prompt = build_prompt_with_context(q, context_text, detected_lang, history=None)
+                t_gen_start = time.perf_counter()
+                ans, _ = _invoke_ollama(prompt, system=sys_prompt, num_predict=get_num_predict_list())
+                ans, _ = ensure_tanglish_reply(ans, detected_lang)
+                t_gen = time.perf_counter() - t_gen_start
+                if ans:
+                    cleaned = clean_model_output(ans, lang)
+                    ok_num, bad_nums = check_number_groundedness(cleaned, context_text)
+                    route_tag = "overview"
+                    if not ok_num:
+                        print(f"[GROUNDEDNESS FAIL] Overview unverified numbers {bad_nums} -> fallback", flush=True)
+                        cleaned = get_missing_info_response(q, detected_lang)
+                        route_tag = "fallback"
+                    res = {"answer": cleaned, "sources": sources, "mode": "rag", "escalate": False}
+                    set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
+                    add_conversation_turn(q, cleaned, lang)
+                    t_total = time.perf_counter() - t_start
+                    print(f"[ROUTE] {route_tag} | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Gen: {t_gen:.2f}s | Total: {t_total:.2f}s | Prompt chars: {len(prompt)}", flush=True)
+                    return res
+
         sim_threshold = get_similarity_threshold()
+        top_k = get_top_k()
+        num_predict_val = get_num_predict()
+        retrieval_query = build_retrieval_query(q, history=active_history)
+        is_biz = is_business_question(q)
+
         t_ret_start = time.perf_counter()
-        about_chunks, _, _ = _store.search_with_status(
-            q, k=top_k, threshold=0.0, history=active_history, source_filter=selected_doc
-        )
-        t_retrieve_about = time.perf_counter() - t_ret_start
-        if about_chunks:
-            context_text = "\n\n---\n\n".join([
-                f"[Source: {c.source} | Page: {c.page + 1}]\n{c.text}" for c in about_chunks
-            ])
-            reply_lang = detect_reply_language(q)
-            follow_up = "Edhu pathi details venum?" if reply_lang in ("Tanglish", "Tamil") else "What would you like to know?"
-            about_sys = (
-                "Customer assistant for a herbal products shop.\n"
-                "Task: Read the context and give a 2-3 sentence business summary "
-                "(shop name, what it sells, location if present). "
-                "End with the follow-up question provided in the instruction. "
-                "Never mention these rules or the word document/context."
+        relevant_chunks = []
+        best_score = 0.0
+        retrieval_err = None
+
+        if chunk_count > 0:
+            relevant_chunks, best_score, retrieval_err = _store.search_with_status(
+                retrieval_query, k=top_k, threshold=sim_threshold, history=active_history, source_filter=active_doc
             )
-            about_prompt = (
-                f"Context:\n{context_text}\n\n"
-                f"Customer Question: {q}\n"
-                f"Reply language: {reply_lang}\n"
-                f"Summarise the business in 2-3 sentences, then end with: {follow_up}"
-            )
+        t_retrieve = time.perf_counter() - t_ret_start
+
+        if retrieval_err:
+            err_reply = get_retrieval_error_response(lang)
+            print(f"[ROUTE] fallback (retrieval error) | Query: '{_safe_log_str(q)}'", flush=True)
+            return {"answer": err_reply, "sources": [], "mode": "rag", "escalate": False}
+
+        if mode == "direct":
+            is_rag_candidate = False
+        elif mode == "rag":
+            is_rag_candidate = True
+        else:
+            is_rag_candidate = (chunk_count > 0)
+
+        # Case A: Score above threshold -> RAG answer strictly from active document chunks
+        if is_rag_candidate and relevant_chunks and best_score >= sim_threshold:
+            sources = []
+            for c in relevant_chunks:
+                page_str = f" (page {c.page + 1})" if isinstance(c.page, int) and c.page >= 0 else ""
+                source_label = f"{c.source}{page_str}"
+                if source_label not in sources:
+                    sources.append(source_label)
+
+            context_text = format_context_chunks(relevant_chunks, max_total_chars=1400)
+            detected_lang = detect_reply_language(q)
+            sys_prompt = get_slm_rag_prompt(detected_lang, is_list=False)
+            prompt = build_prompt_with_context(q, context_text, detected_lang, history=active_history)
+
             t_gen_start = time.perf_counter()
-            about_ans, _ = _invoke_ollama(about_prompt, system=about_sys)
-            t_gen_about = time.perf_counter() - t_gen_start
-            if about_ans:
-                cleaned = clean_model_output(about_ans, lang)
-                res = {"answer": cleaned, "sources": [], "mode": "rag", "escalate": False}
-                set_cached_response(q, res)
+            ollama_answer, ollama_err = _invoke_ollama(prompt, system=sys_prompt, num_predict=num_predict_val)
+            ollama_answer, retried = ensure_tanglish_reply(ollama_answer, detected_lang)
+            t_gen = time.perf_counter() - t_gen_start
+            print(f"[LANGUAGE] Query: '{_safe_log_str(q)}' | Detected: {detected_lang} | Step 2 Retry: {retried}", flush=True)
+
+            if ollama_answer:
+                cleaned = clean_model_output(ollama_answer, lang)
+                ok_num, bad_nums = check_number_groundedness(cleaned, context_text)
+                route_tag = "rag-answer"
+                if not ok_num:
+                    print(f"[GROUNDEDNESS FAIL] Unverified numbers {bad_nums} -> replacing with missing info", flush=True)
+                    cleaned = get_missing_info_response(q, detected_lang)
+                    route_tag = "fallback"
+                elif "not available" in cleaned.lower() or "la illa" in cleaned.lower():
+                    route_tag = "fallback"
+                res = {"answer": cleaned, "sources": sources, "mode": "rag", "escalate": False}
+                set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
                 add_conversation_turn(q, cleaned, lang)
                 t_total = time.perf_counter() - t_start
-                print(f"[TIMING] About-question | Retrieval: {t_retrieve_about:.2f}s | Generation: {t_gen_about:.2f}s | Total: {t_total:.2f}s")
+                print(f"[ROUTE] {route_tag} | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Gen: {t_gen:.2f}s | Total: {t_total:.2f}s | Prompt chars: {len(prompt)}", flush=True)
                 return res
 
-    # Chat history: keep only the last 2 turns for minimal token overhead
-    raw_history = history if history is not None else get_conversation_history()
-    active_history = raw_history[-2:] if raw_history else []
+            groq_ans, _ = _invoke_groq(f"System: {sys_prompt}\n\n{prompt}")
+            if groq_ans:
+                cleaned = clean_model_output(groq_ans, lang)
+                ok_num, bad_nums = check_number_groundedness(cleaned, context_text)
+                route_tag = "rag-answer"
+                if not ok_num:
+                    cleaned = get_missing_info_response(q, detected_lang)
+                    route_tag = "fallback"
+                res = {"answer": cleaned, "sources": sources, "mode": "rag", "escalate": False}
+                set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
+                add_conversation_turn(q, cleaned, lang)
+                print(f"[ROUTE] {route_tag} (groq) | Query: '{_safe_log_str(q)}'", flush=True)
+                return res
 
-    chunk_count = _store.count()
-    sim_threshold = get_similarity_threshold()
-    top_k = get_top_k()
-    is_biz = is_business_question(q)
-
-    # Search ChromaDB / store and check similarity score
-    t_ret_start = time.perf_counter()
-    relevant_chunks = []
-    best_score = 0.0
-    retrieval_err = None
-
-    if chunk_count > 0:
-        relevant_chunks, best_score, retrieval_err = _store.search_with_status(
-            q, k=top_k, threshold=sim_threshold, history=active_history, source_filter=selected_doc
-        )
-    t_retrieve = time.perf_counter() - t_ret_start
-
-    # Handle retrieval error
-    if retrieval_err:
-        err_reply = get_retrieval_error_response(lang)
-        return {"answer": err_reply, "sources": [], "mode": "rag", "escalate": False}
-
-    # Determine candidate mode
-    if mode == "direct":
-        is_rag_candidate = False
-    elif mode == "rag":
-        is_rag_candidate = True
-    else:  # auto
-        is_rag_candidate = (chunk_count > 0)
-
-    # ── CHANGE 2 ROUTING ──────────────────────────────────────────────────
-    # Case A: Score above threshold -> RAG answer strictly from retrieved chunks
-    if is_rag_candidate and relevant_chunks and best_score >= sim_threshold:
-        sources = []
-        for c in relevant_chunks:
-            page_str = f" (page {c.page + 1})" if isinstance(c.page, int) and c.page >= 0 else ""
-            source_label = f"{c.source}{page_str}"
-            if source_label not in sources:
-                sources.append(source_label)
-
-        context_text = "\n\n---\n\n".join([
-            f"[Source: {c.source} | Page: {c.page + 1}]\n{c.text}" for c in relevant_chunks
-        ])
+        # Case B: Below threshold -> fallback for specific detail queries against indexed docs; escalation otherwise
         detected_lang = detect_reply_language(q)
-        sys_prompt = get_slm_rag_prompt(detected_lang)
-        prompt = build_prompt_with_context(q, context_text, detected_lang, history=active_history)
+        if _is_explicit_escalation_query(q) or (is_biz and chunk_count == 0):
+            escalate_msg = get_escalation_response(detected_lang)
+            res = {"answer": escalate_msg, "sources": [], "mode": "rag", "escalate": True}
+            set_cached_response(q, {**res, "route": "escalation"}, doc_key=doc_key)
+            add_conversation_turn(q, escalate_msg, detected_lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] escalation | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Total: {t_total:.2f}s | Score: {best_score:.3f} < {sim_threshold}", flush=True)
+            return res
+
+        if (is_biz and chunk_count > 0) or mode == "rag":
+            missing_reply = get_missing_info_response(q, detected_lang)
+            res = {"answer": missing_reply, "sources": [], "mode": "rag", "escalate": False}
+            set_cached_response(q, {**res, "route": "fallback"}, doc_key=doc_key)
+            add_conversation_turn(q, missing_reply, detected_lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] fallback | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Total: {t_total:.2f}s | Score: {best_score:.3f} < {sim_threshold}", flush=True)
+            return res
+
+        # Case C: General question (not business) -> Direct model answer
+        conv_prompt = build_conversational_prompt(q, detected_lang, history=active_history)
+        conv_sys = get_slm_conversational_prompt(detected_lang)
 
         t_gen_start = time.perf_counter()
-        ollama_answer, ollama_err = _invoke_ollama(prompt, system=sys_prompt)
-        
-        # FIX 3: Two-step fallback for Tanglish reliability
-        ollama_answer, retried = ensure_tanglish_reply(ollama_answer, detected_lang)
+        ollama_ans, ollama_err = _invoke_ollama(conv_prompt, system=conv_sys)
+        ollama_ans, retried = ensure_tanglish_reply(ollama_ans, detected_lang)
         t_gen = time.perf_counter() - t_gen_start
-        print(f"[LANGUAGE] Query: '{_safe_log_str(q)}' | Detected: {detected_lang} | Step 2 Retry: {retried}")
+        print(f"[LANGUAGE] Query: '{_safe_log_str(q)}' | Detected: {detected_lang} | Step 2 Retry: {retried}", flush=True)
 
-        if ollama_answer:
-            cleaned = clean_model_output(ollama_answer, lang)
-            res = {"answer": cleaned, "sources": sources, "mode": "rag", "escalate": False}
-            set_cached_response(q, res)
+        if ollama_ans:
+            cleaned = clean_model_output(ollama_ans, lang)
+            res = {"answer": cleaned, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, {**res, "route": "rag-answer"}, doc_key=doc_key)
             add_conversation_turn(q, cleaned, lang)
             t_total = time.perf_counter() - t_start
-            print(f"[TIMING] Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Generation: {t_gen:.2f}s | Total: {t_total:.2f}s | Top Score: {best_score:.3f} >= {sim_threshold}")
+            print(f"[ROUTE] rag-answer (direct) | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Gen: {t_gen:.2f}s | Total: {t_total:.2f}s", flush=True)
             return res
 
-        # Fallback to groq if local ollama failed
-        groq_ans, _ = _invoke_groq(f"System: {sys_prompt}\n\n{prompt}")
+        groq_ans, _ = _invoke_groq(f"System: {conv_sys}\n\n{conv_prompt}")
         if groq_ans:
             cleaned = clean_model_output(groq_ans, lang)
-            res = {"answer": cleaned, "sources": sources, "mode": "rag", "escalate": False}
-            set_cached_response(q, res)
+            res = {"answer": cleaned, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, {**res, "route": "rag-answer"}, doc_key=doc_key)
             add_conversation_turn(q, cleaned, lang)
             return res
 
-    # Case B: Score below threshold but looks business-related -> Escalate immediately in detected language
-    if is_biz:
-        detected_lang = detect_reply_language(q)
-        escalate_msg = get_escalation_response(detected_lang)
-        res = {"answer": escalate_msg, "sources": [], "mode": "rag", "escalate": True}
-        set_cached_response(q, res)
-        add_conversation_turn(q, escalate_msg, detected_lang)
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Generation: 0.00s | Total: {t_total:.2f}s | Score: {best_score:.3f} < {sim_threshold} (Escalated in {detected_lang})")
-        return res
-
-    # Explicit RAG requested but information not found
-    if mode == "rag":
-        dynamic_prompt = (
-            f"The user asked: {q}\n"
-            f"STATUS: This specific topic was not found in the verified project documentation.\n"
-            f"TARGET LANGUAGE STYLE: {lang}.\n"
-            f"INSTRUCTION: In 1 or 2 sentences in {lang}, politely inform the user that this information "
-            f"is not available in the project documentation and suggest uploading the relevant document or providing more details."
-        )
-        ollama_res, _ = _invoke_ollama(dynamic_prompt, system=get_slm_rag_prompt())
-        missing_reply = clean_model_output(ollama_res, lang) if ollama_res else get_missing_info_response(q, lang)
-        res = {"answer": missing_reply, "sources": [], "mode": "rag", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, missing_reply, lang)
-        return res
-
-    # Case C: Score below threshold & general question (not business) -> Direct model answer
-    detected_lang = detect_reply_language(q)
-    conv_prompt = build_conversational_prompt(q, detected_lang, history=active_history)
-    conv_sys = get_slm_conversational_prompt(detected_lang)
-
-    t_gen_start = time.perf_counter()
-    ollama_ans, ollama_err = _invoke_ollama(conv_prompt, system=conv_sys)
-    ollama_ans, retried = ensure_tanglish_reply(ollama_ans, detected_lang)
-    t_gen = time.perf_counter() - t_gen_start
-    print(f"[LANGUAGE] Query: '{_safe_log_str(q)}' | Detected: {detected_lang} | Step 2 Retry: {retried}")
-
-    if ollama_ans:
-        cleaned = clean_model_output(ollama_ans, lang)
-        res = {"answer": cleaned, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, cleaned, lang)
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Generation: {t_gen:.2f}s | Total: {t_total:.2f}s (Direct LLM)")
-        return res
-
-    # Fallback to groq
-    groq_ans, _ = _invoke_groq(f"System: {conv_sys}\n\n{conv_prompt}")
-    if groq_ans:
-        cleaned = clean_model_output(groq_ans, lang)
-        res = {"answer": cleaned, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, cleaned, lang)
-        return res
-
-    missing_resp = get_missing_info_response(q, lang)
-    res = {"answer": missing_resp, "sources": [], "mode": "direct", "escalate": False}
-    return res
+        print(f"[ROUTE] fallback (no llm response) | Query: '{_safe_log_str(q)}'", flush=True)
+        return {"answer": get_missing_info_response(q, detected_lang), "sources": [], "mode": "direct", "escalate": False}
+    except Exception as e:
+        print(f"[Chat Error] ask_question unhandled exception: {e}", flush=True)
+        traceback.print_exc()
+        return {
+            "answer": "Sorry, a temporary error occurred while processing your question. Please try again.",
+            "sources": [],
+            "mode": "direct",
+            "escalate": False,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1915,225 +2627,294 @@ def stream_ask_question(
 ):
     """
     Generator yielding Server-Sent Events (SSE) for streaming responses.
-    - Yields initial token instantly for small-talk, cached queries, and escalations.
-    - Yields model tokens as generated (max 120 tokens, CPU response within 3-8s).
+    Wraps the entire generator in try/except, resolves single active document,
+    handles upload-ack & overview routes, checks number groundedness, and logs route tags.
     """
     t_start = time.perf_counter()
-    q = question.strip()
-    if not q:
-        yield f"data: {json.dumps({'error': 'Please enter a valid question.'})}\n\n"
-        return
+    try:
+        q = (question or "").strip()
+        if not q:
+            yield f"data: {json.dumps({'error': 'Please enter a valid question.'})}\n\n"
+            return
 
-    # 1. Instant Greeting Check at the VERY START (no LLM, no retrieval, under 100ms)
-    greeting_reply = get_greeting_reply(q)
-    if greeting_reply:
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING - Stream] Query: '{_safe_log_str(q)}' | Stage: Greeting (Instant) | Total: {t_total*1000:.1f}ms")
-        res = {"answer": greeting_reply, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, greeting_reply, detect_language_style(q))
-        yield f"data: {json.dumps({'token': greeting_reply})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
-        return
+        active_doc = resolve_active_document(selected_doc)
+        doc_key = active_doc or ""
 
-    lang = detect_language_style(q)
+        # 1. Instant Greeting Check at the VERY START
+        greeting_reply = get_greeting_reply(q)
+        if greeting_reply:
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] greeting | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            res = {"answer": greeting_reply, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, {**res, "route": "greeting"}, doc_key=doc_key)
+            add_conversation_turn(q, greeting_reply, detect_language_style(q))
+            yield f"data: {json.dumps({'token': greeting_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+            return
 
-    # 1. In-memory cache check
-    cached = get_cached_response(q)
-    if cached is not None:
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING - Stream] Query: '{_safe_log_str(q)}' | Cache Hit | Total: {t_total*1000:.1f}ms")
-        yield f"data: {json.dumps({'token': cached.get('answer', '')})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': cached.get('sources', []), 'mode': cached.get('mode', 'direct'), 'escalate': cached.get('escalate', False)})}\n\n"
-        return
+        # 2. Upload / Acknowledgement check (never trigger retrieval or fallback)
+        if is_upload_ack_message(q):
+            ack_reply = get_upload_ack_reply(q)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] upload-ack | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            add_conversation_turn(q, ack_reply, detect_language_style(q))
+            yield f"data: {json.dumps({'token': ack_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+            return
 
-    # 2. CHANGE 1: Instant Greeting & Small Talk (< 100 ms)
-    is_st, st_reply, _ = classify_smalltalk(q)
-    if is_st:
-        res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, st_reply, lang)
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING - Stream] Query: '{_safe_log_str(q)}' | Instant Smalltalk | Total: {t_total*1000:.1f}ms")
-        yield f"data: {json.dumps({'token': st_reply})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
-        return
+        lang = detect_language_style(q)
 
-    # Identity check
-    if is_identity_question(q):
-        resp = get_identity_response(lang)
-        res = {"answer": resp, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, resp, lang)
-        yield f"data: {json.dumps({'token': resp})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
-        return
+        # 3. In-memory cache check
+        cached = get_cached_response(q, doc_key=doc_key)
+        if cached is not None:
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] {cached.get('route', 'rag-answer')} (cache) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            yield f"data: {json.dumps({'token': cached.get('answer', '')})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': cached.get('sources', []), 'mode': cached.get('mode', 'direct'), 'escalate': cached.get('escalate', False)})}\n\n"
+            return
 
-    # About-question check: stream business summary from doc
-    if is_about_question(q) and _store.count() > 0:
-        raw_history = history if history is not None else get_conversation_history()
-        active_history = raw_history[-2:] if raw_history else []
+        # 4. Instant small talk
+        is_st, st_reply, _ = classify_smalltalk(q)
+        if is_st:
+            res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, {**res, "route": "greeting"}, doc_key=doc_key)
+            add_conversation_turn(q, st_reply, lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] greeting (smalltalk) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            yield f"data: {json.dumps({'token': st_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+            return
+
+        # 5. Identity check
+        if is_identity_question(q):
+            resp = get_identity_response(lang)
+            res = {"answer": resp, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, {**res, "route": "greeting"}, doc_key=doc_key)
+            add_conversation_turn(q, resp, lang)
+            print(f"[ROUTE] greeting (identity) | Query: '{_safe_log_str(q)}'", flush=True)
+            yield f"data: {json.dumps({'token': resp})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+            return
+
+        raw_history = history if isinstance(history, list) else get_conversation_history()
+        active_history = raw_history[-2:] if isinstance(raw_history, list) and raw_history else []
+        chunk_count = _store.count()
+
+        # 6. Overview / List question -> retrieve opening + catalog chunks from active doc
+        if is_list_or_overview_question(q) and chunk_count > 0 and mode != "direct":
+            top_k_list = get_top_k_list()
+            t_ret_start = time.perf_counter()
+            overview_chunks = get_overview_chunks(active_doc, top_k=top_k_list)
+            t_retrieve = time.perf_counter() - t_ret_start
+            if overview_chunks:
+                sources = []
+                for c in overview_chunks:
+                    page_str = f" (page {c.page + 1})" if isinstance(c.page, int) and c.page >= 0 else ""
+                    label = f"{c.source}{page_str}"
+                    if label not in sources:
+                        sources.append(label)
+                context_text = format_overview_chunks(overview_chunks, max_total_chars=2000)
+                detected_lang = detect_reply_language(q)
+                sys_prompt = get_slm_rag_prompt(detected_lang, is_list=True)
+                prompt = build_prompt_with_context(q, context_text, detected_lang, history=None)
+
+                accumulated = []
+                t_gen_start = time.perf_counter()
+                t_first_token = None
+                stream_err = None
+                try:
+                    for token in _stream_ollama(prompt, system=sys_prompt, num_predict=get_num_predict_list()):
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter() - t_gen_start
+                        accumulated.append(token)
+                except Exception as e:
+                    stream_err = e
+                    print(f"[Ollama Stream Error] Overview stream error: {e}", flush=True)
+                    traceback.print_exc()
+
+                full_ans = clean_model_output("".join(accumulated).strip(), lang)
+                if full_ans:
+                    ok_num, bad_nums = check_number_groundedness(full_ans, context_text)
+                    route_tag = "overview"
+                    if not ok_num:
+                        print(f"[GROUNDEDNESS FAIL] Overview unverified numbers {bad_nums} -> fallback", flush=True)
+                        full_ans = get_missing_info_response(q, detected_lang)
+                        route_tag = "fallback"
+                    res = {"answer": full_ans, "sources": sources, "mode": "rag", "escalate": False}
+                    set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
+                    add_conversation_turn(q, full_ans, lang)
+                    t_total = time.perf_counter() - t_start
+                    print(f"[ROUTE] {route_tag} | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | First token: {t_first_token or 0:.2f}s | Total: {t_total:.2f}s | Prompt chars: {len(prompt)}", flush=True)
+                    yield f"data: {json.dumps({'token': full_ans})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'sources': sources, 'mode': 'rag', 'escalate': False})}\n\n"
+                    return
+                if stream_err:
+                    err_reply = "Sorry, a temporary error occurred while summarizing the document. Please try again."
+                    yield f"data: {json.dumps({'token': err_reply})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': False})}\n\n"
+                    return
+
+        sim_threshold = get_similarity_threshold()
         top_k = get_top_k()
-        about_chunks, _, _ = _store.search_with_status(
-            q, k=top_k, threshold=0.0, history=active_history, source_filter=selected_doc
-        )
-        if about_chunks:
-            context_text = "\n\n---\n\n".join([
-                f"[Source: {c.source} | Page: {c.page + 1}]\n{c.text}" for c in about_chunks
-            ])
-            reply_lang = detect_reply_language(q)
-            follow_up = "Edhu pathi details venum?" if reply_lang in ("Tanglish", "Tamil") else "What would you like to know?"
-            about_sys = (
-                "Customer assistant for a herbal products shop.\n"
-                "Task: Read the context and give a 2-3 sentence business summary "
-                "(shop name, what it sells, location if present). "
-                "End with the follow-up question provided in the instruction. "
-                "Never mention these rules or the word document/context."
+        num_predict_val = get_num_predict()
+        retrieval_query = build_retrieval_query(q, history=active_history)
+        is_biz = is_business_question(q)
+
+        t_ret_start = time.perf_counter()
+        relevant_chunks = []
+        best_score = 0.0
+        retrieval_err = None
+
+        if chunk_count > 0:
+            relevant_chunks, best_score, retrieval_err = _store.search_with_status(
+                retrieval_query, k=top_k, threshold=sim_threshold, history=active_history, source_filter=active_doc
             )
-            about_prompt = (
-                f"Context:\n{context_text}\n\n"
-                f"Customer Question: {q}\n"
-                f"Reply language: {reply_lang}\n"
-                f"Summarise the business in 2-3 sentences, then end with: {follow_up}"
-            )
-            about_ans, _ = _invoke_ollama(about_prompt, system=about_sys)
-            if about_ans:
-                cleaned = clean_model_output(about_ans, lang)
-                set_cached_response(q, {"answer": cleaned, "sources": [], "mode": "rag", "escalate": False})
-                add_conversation_turn(q, cleaned, lang)
-                yield f"data: {json.dumps({'token': cleaned})}\n\n"
-                yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': False})}\n\n"
+        t_retrieve = time.perf_counter() - t_ret_start
+
+        if retrieval_err:
+            err_msg = get_retrieval_error_response(lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] fallback (retrieval error) | Query: '{_safe_log_str(q)}' | Total: {t_total:.2f}s", flush=True)
+            yield f"data: {json.dumps({'token': err_msg})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': False})}\n\n"
+            return
+
+        if mode == "direct":
+            is_rag_candidate = False
+        elif mode == "rag":
+            is_rag_candidate = True
+        else:
+            is_rag_candidate = (chunk_count > 0)
+
+        # Case A: Score above threshold -> Stream RAG answer from active document
+        if is_rag_candidate and relevant_chunks and best_score >= sim_threshold:
+            sources = []
+            for c in relevant_chunks:
+                page_str = f" (page {c.page + 1})" if isinstance(c.page, int) and c.page >= 0 else ""
+                source_label = f"{c.source}{page_str}"
+                if source_label not in sources:
+                    sources.append(source_label)
+
+            context_text = format_context_chunks(relevant_chunks, max_total_chars=1400)
+            detected_lang = detect_reply_language(q)
+            prompt = build_prompt_with_context(q, context_text, detected_lang, history=active_history)
+            sys_prompt = get_slm_rag_prompt(detected_lang, is_list=False)
+
+            accumulated = []
+            t_gen_start = time.perf_counter()
+            t_first_token = None
+            stream_err = None
+            try:
+                for token in _stream_ollama(prompt, system=sys_prompt, num_predict=num_predict_val):
+                    if t_first_token is None:
+                        t_first_token = time.perf_counter() - t_gen_start
+                    accumulated.append(token)
+            except Exception as e:
+                stream_err = e
+                print(f"[Ollama Stream Error] RAG stream error: {e}", flush=True)
+                traceback.print_exc()
+
+            full_ans = clean_model_output("".join(accumulated).strip(), lang)
+            if full_ans:
+                ok_num, bad_nums = check_number_groundedness(full_ans, context_text)
+                route_tag = "rag-answer"
+                if not ok_num:
+                    print(f"[GROUNDEDNESS FAIL] Unverified numbers {bad_nums} -> replacing with missing info", flush=True)
+                    full_ans = get_missing_info_response(q, detected_lang)
+                    route_tag = "fallback"
+                elif "not available" in full_ans.lower() or "la illa" in full_ans.lower():
+                    route_tag = "fallback"
+                res = {"answer": full_ans, "sources": sources, "mode": "rag", "escalate": False}
+                set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
+                add_conversation_turn(q, full_ans, lang)
+                t_total = time.perf_counter() - t_start
+                print(f"[ROUTE] {route_tag} | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | First token: {t_first_token or 0:.2f}s | Total: {t_total:.2f}s | Prompt chars: {len(prompt)}", flush=True)
+                yield f"data: {json.dumps({'token': full_ans})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'sources': sources, 'mode': 'rag', 'escalate': False})}\n\n"
                 return
 
-    raw_history = history if history is not None else get_conversation_history()
-    active_history = raw_history[-2:] if raw_history else []
+            if stream_err:
+                print(f"[Ollama] Generation failed with error: {stream_err}", flush=True)
+            else:
+                print("[Ollama] Generation yielded 0 tokens", flush=True)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] fallback (stream error) | Query: '{_safe_log_str(q)}' | Total: {t_total:.2f}s", flush=True)
+            err_reply = "Sorry, Ollama could not generate a reply right now. Please try again."
+            yield f"data: {json.dumps({'token': err_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': sources, 'mode': 'rag', 'escalate': False})}\n\n"
+            return
 
-    chunk_count = _store.count()
-    sim_threshold = get_similarity_threshold()
-    top_k = get_top_k()
-    is_biz = is_business_question(q)
-
-    t_ret_start = time.perf_counter()
-    relevant_chunks = []
-    best_score = 0.0
-    retrieval_err = None
-
-    if chunk_count > 0:
-        relevant_chunks, best_score, retrieval_err = _store.search_with_status(
-            q, k=top_k, threshold=sim_threshold, history=active_history, source_filter=selected_doc
-        )
-    t_retrieve = time.perf_counter() - t_ret_start
-
-    # Handle retrieval error
-    if retrieval_err:
-        err_msg = get_retrieval_error_response(lang)
-        yield f"data: {json.dumps({'token': err_msg})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': False})}\n\n"
-        return
-
-    # Determine candidate mode
-    if mode == "direct":
-        is_rag_candidate = False
-    elif mode == "rag":
-        is_rag_candidate = True
-    else:  # auto
-        is_rag_candidate = (chunk_count > 0)
-
-    # ── CHANGE 2 STREAM ROUTING ─────────────────────────────────────────────
-    # Case A: Score above threshold -> Stream RAG answer from documents
-    if is_rag_candidate and relevant_chunks and best_score >= sim_threshold:
-        sources = []
-        for c in relevant_chunks:
-            page_str = f" (page {c.page + 1})" if isinstance(c.page, int) and c.page >= 0 else ""
-            source_label = f"{c.source}{page_str}"
-            if source_label not in sources:
-                sources.append(source_label)
-
-        context_text = "\n\n---\n\n".join([
-            f"[Source: {c.source} | Page: {c.page + 1}]\n{c.text}" for c in relevant_chunks
-        ])
+        # Case B: Score below threshold
         detected_lang = detect_reply_language(q)
-        prompt = build_prompt_with_context(q, context_text, detected_lang, history=active_history)
-        sys_prompt = get_slm_rag_prompt(detected_lang)
-        print(f"[LANGUAGE - Stream] Query: '{_safe_log_str(q)}' | Detected: {detected_lang}")
+        if _is_explicit_escalation_query(q) or (is_biz and chunk_count == 0):
+            escalate_msg = get_escalation_response(detected_lang)
+            res = {"answer": escalate_msg, "sources": [], "mode": "rag", "escalate": True}
+            set_cached_response(q, {**res, "route": "escalation"}, doc_key=doc_key)
+            add_conversation_turn(q, escalate_msg, detected_lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] escalation | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Total: {t_total:.2f}s | Score: {best_score:.3f} < {sim_threshold}", flush=True)
+            yield f"data: {json.dumps({'token': escalate_msg})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': True})}\n\n"
+            return
+
+        if (is_biz and chunk_count > 0) or mode == "rag":
+            missing_reply = get_missing_info_response(q, detected_lang)
+            res = {"answer": missing_reply, "sources": [], "mode": "rag", "escalate": False}
+            set_cached_response(q, {**res, "route": "fallback"}, doc_key=doc_key)
+            add_conversation_turn(q, missing_reply, detected_lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] fallback | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Total: {t_total:.2f}s | Score: {best_score:.3f} < {sim_threshold}", flush=True)
+            yield f"data: {json.dumps({'token': missing_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': False})}\n\n"
+            return
+
+        # Case C: General question -> Direct model streaming
+        conv_prompt = build_conversational_prompt(q, lang, history=active_history)
+        conv_sys = get_slm_conversational_prompt(detected_lang)
 
         has_streamed = False
         accumulated = []
         t_gen_start = time.perf_counter()
+        t_first_token = None
+        stream_err = None
         try:
-            for token in _stream_ollama(prompt, system=sys_prompt):
+            for token in _stream_ollama(conv_prompt, system=conv_sys, num_predict=num_predict_val):
+                if not has_streamed:
+                    t_first_token = time.perf_counter() - t_gen_start
                 has_streamed = True
                 accumulated.append(token)
                 yield f"data: {json.dumps({'token': token})}\n\n"
-        except Exception:
-            pass
-        t_gen = time.perf_counter() - t_gen_start
+        except Exception as e:
+            stream_err = e
+            print(f"[Ollama Stream Error] Direct stream error: {e}", flush=True)
+            traceback.print_exc()
 
         if has_streamed:
             full_ans = "".join(accumulated).strip()
-            res = {"answer": full_ans, "sources": sources, "mode": "rag", "escalate": False}
-            set_cached_response(q, res)
+            res = {"answer": full_ans, "sources": [], "mode": "direct", "escalate": False}
+            set_cached_response(q, {**res, "route": "rag-answer"}, doc_key=doc_key)
             add_conversation_turn(q, full_ans, lang)
             t_total = time.perf_counter() - t_start
-            print(f"[TIMING - Stream] Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Generation: {t_gen:.2f}s | Total: {t_total:.2f}s (RAG Stream)")
-            yield f"data: {json.dumps({'done': True, 'sources': sources, 'mode': 'rag', 'escalate': False})}\n\n"
+            print(f"[ROUTE] rag-answer (direct) | Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | First token: {t_first_token or 0:.2f}s | Total: {t_total:.2f}s | Prompt chars: {len(conv_prompt)}", flush=True)
+            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
             return
 
-        # Fallback to ask_question
-        fallback_res = ask_question(q, history=active_history, mode="rag", selected_doc=selected_doc)
-        yield f"data: {json.dumps({'token': fallback_res.get('answer', '')})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': sources, 'mode': 'rag', 'escalate': False})}\n\n"
-        return
-
-    # Case B: Score below threshold but looks business-related -> Escalate immediately in detected language
-    if is_biz:
-        detected_lang = detect_reply_language(q)
-        escalate_msg = get_escalation_response(detected_lang)
-        res = {"answer": escalate_msg, "sources": [], "mode": "rag", "escalate": True}
-        set_cached_response(q, res)
-        add_conversation_turn(q, escalate_msg, detected_lang)
+        if stream_err:
+            print(f"[Ollama] Direct stream generation failed: {stream_err}", flush=True)
+        else:
+            print("[Ollama] Direct stream yielded 0 tokens", flush=True)
         t_total = time.perf_counter() - t_start
-        print(f"[TIMING - Stream] Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Generation: 0.00s | Total: {t_total:.2f}s | Score: {best_score:.3f} < {sim_threshold} (Escalated in {detected_lang})")
-        yield f"data: {json.dumps({'token': escalate_msg})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': True})}\n\n"
-        return
-
-    # Explicit RAG mode requested but not found
-    if mode == "rag":
-        fallback_res = ask_question(q, history=active_history, mode="rag", selected_doc=selected_doc)
-        yield f"data: {json.dumps({'token': fallback_res.get('answer', '')})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'rag', 'escalate': False})}\n\n"
-        return
-
-    # Case C: Score below threshold & general question -> Direct model streaming
-    conv_prompt = build_conversational_prompt(q, lang, history=active_history)
-    conv_sys = get_slm_conversational_prompt()
-
-    has_streamed = False
-    accumulated = []
-    t_gen_start = time.perf_counter()
-    try:
-        for token in _stream_ollama(conv_prompt, system=conv_sys):
-            has_streamed = True
-            accumulated.append(token)
-            yield f"data: {json.dumps({'token': token})}\n\n"
-    except Exception:
-        pass
-    t_gen = time.perf_counter() - t_gen_start
-
-    if has_streamed:
-        full_ans = "".join(accumulated).strip()
-        res = {"answer": full_ans, "sources": [], "mode": "direct", "escalate": False}
-        set_cached_response(q, res)
-        add_conversation_turn(q, full_ans, lang)
-        t_total = time.perf_counter() - t_start
-        print(f"[TIMING - Stream] Query: '{_safe_log_str(q)}' | Retrieval: {t_retrieve:.2f}s | Generation: {t_gen:.2f}s | Total: {t_total:.2f}s (Direct Stream)")
+        print(f"[ROUTE] fallback (direct stream error) | Query: '{_safe_log_str(q)}' | Total: {t_total:.2f}s", flush=True)
+        err_reply = "Sorry, Ollama could not respond right now. Please try again."
+        yield f"data: {json.dumps({'token': err_reply})}\n\n"
         yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
         return
-
-    fallback_res = ask_question(q, history=active_history, mode="direct")
-    yield f"data: {json.dumps({'token': fallback_res.get('answer', '')})}\n\n"
-    yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+    except Exception as e:
+        print(f"[Chat Stream Error] Unhandled exception in stream_ask_question: {e}", flush=True)
+        traceback.print_exc()
+        yield f"data: {json.dumps({'token': 'Sorry, a temporary error occurred. Please try again.'})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+        return
 
 
 def get_system_status() -> dict:
@@ -2194,6 +2975,8 @@ def remove_document(filename: str) -> dict:
     # Remove chunks belonging to this file
     _store.chunks = [c for c in _store.chunks if c.source != clean_name]
     del _store.file_registry[clean_name]
+    if _store.last_uploaded_doc == clean_name:
+        _store.last_uploaded_doc = list(_store.file_registry.keys())[-1] if _store.file_registry else None
     _store.save()
     clear_query_cache()
 
