@@ -4,7 +4,7 @@
 
 ## What it does
 
-Upload project documentation (PDF or TXT) and ask questions about it. The chatbot retrieves relevant sections from your project documents and uses a local **Small Language Model (SLM)** such as **Gemma 3n E2B** (via Ollama) to answer accurately — all locally, all private.
+Upload project documentation (PDF or TXT) and ask questions about it. The chatbot retrieves relevant sections from your project documents and uses a local **Small Language Model (SLM)** such as **Qwen 2.5 1.5B** (via Ollama) to answer accurately — all locally, all private.
 
 Unlike generic Large Language Models (LLMs), this chatbot operates with a dedicated SLM persona specifically tailored to answer questions regarding your project's documentation.
 
@@ -14,7 +14,7 @@ Unlike generic Large Language Models (LLMs), this chatbot operates with a dedica
 
 | Layer | Tool |
 |---|---|
-| Model (SLM) | Gemma 3n E2B · Ollama (Small Language Model) |
+| Model (SLM) | Qwen 2.5 1.5B · Ollama (Small Language Model) |
 | Backend | Python · FastAPI · LangChain |
 | Vector DB | ChromaDB / BM25 Store |
 | Embeddings | sentence-transformers |
@@ -29,7 +29,7 @@ Unlike generic Large Language Models (LLMs), this chatbot operates with a dedica
 
 ```bash
 # 1. Pull the model
-ollama pull gemma3n:e2b
+ollama pull qwen2.5:1.5b
 
 # 2. Create environment
 cd backend
@@ -76,7 +76,7 @@ rag-chatbot/
 | Error | Fix |
 |---|---|
 | Connection refused :11434 | `ollama serve` |
-| model not found | `ollama pull gemma3n:e2b` |
+| model not found | `ollama pull qwen2.5:1.5b` |
 | Activate.ps1 blocked | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
 | Slow responses | Normal on CPU — just wait |
 

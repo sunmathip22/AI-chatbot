@@ -14,12 +14,14 @@ services:
       - ./chromadb_data:/app/chromadb_data
       # Persist uploaded files outside container
       - ./uploads:/app/uploads
+    env_file:
+      - .env
     environment:
       # IMPORTANT: Point to host machine's Ollama, not localhost inside Docker
       # Note: On Windows, Ollama by default binds to 127.0.0.1. To allow Docker containers to reach it,
       # ensure OLLAMA_HOST=0.0.0.0 is set on the host, or run the backend natively without Docker.
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - MODEL_NAME=gemma3n:e2b
+      - MODEL_NAME=${MODEL_NAME:-qwen2.5:1.5b}
       - PROJECT_NAME=${PROJECT_NAME:-Project Documentation}
       - PROJECT_DESCRIPTION=${PROJECT_DESCRIPTION:-Official Project Documentation Assistant}
       - GROQ_API_KEY=${GROQ_API_KEY:-}

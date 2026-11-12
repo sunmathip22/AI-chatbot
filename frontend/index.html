@@ -820,23 +820,14 @@
     }
   });
 
-  newChatBtn.addEventListener("click", async () => {
-    if (activeDocuments.length > 0) {
-      if (confirm("Reset conversation and clear attached documents?")) {
-        await clearDocumentsOnServer();
-        resetChatUI();
-      }
-    } else {
-      resetChatUI();
-    }
+  newChatBtn.addEventListener("click", () => {
+    resetChatUI();
   });
 
   function resetChatUI() {
     messagesContainer.innerHTML = "";
     messagesContainer.appendChild(welcomeView);
     welcomeView.style.display = "block";
-    activeDocuments = [];
-    docStates = {};
     conversationHistory = [];
     renderActiveDocs();
     showToast("Conversation cleared");
@@ -874,17 +865,6 @@
           const welcomeTitle = document.getElementById("welcome-project-title");
           if (welcomeTitle) welcomeTitle.textContent = data.project_name;
           document.title = `${data.project_name} · SLM`;
-        }
-
-        // Sync loaded files from server if any exist
-        if (data.files && Array.isArray(data.files)) {
-          const names = data.files.map(f => f.filename);
-          if (JSON.stringify(names) !== JSON.stringify(activeDocuments)) {
-            activeDocuments = names;
-            // Mark server-restored docs as 'ready'
-            names.forEach(n => { if (!docStates[n]) docStates[n] = "ready"; });
-            renderActiveDocs();
-          }
         }
       } else {
         statusDot.classList.add("offline");
@@ -935,11 +915,9 @@
       `;
     }
 
-    // Show pill immediately in 'processing' state
-    if (!activeDocuments.includes(file.name)) {
-      activeDocuments.push(file.name);
-    }
-    docStates[file.name] = "processing";
+    // Show pill immediately in 'processing' state (one active document at a time)
+    activeDocuments = [file.name];
+    docStates = { [file.name]: "processing" };
     renderActiveDocs();
     showToast(`⏳ Uploading & indexing ${file.name}…`, 6000);
 
@@ -954,9 +932,11 @@
       const data = await res.json();
 
       if (res.ok) {
-        docStates[file.name] = "ready";
+        const uploadedName = data.filename || file.name;
+        activeDocuments = [uploadedName];
+        docStates = { [uploadedName]: "ready" };
         renderActiveDocs();
-        showToast(`✅ ${file.name} — ${data.chunks_created || 0} chunks indexed`, 4000);
+        showToast(`✅ Document received. You can ask me anything about it. (${uploadedName})`, 4000);
       } else {
         docStates[file.name] = "failed";
         renderActiveDocs();

@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import traceback
@@ -16,7 +17,8 @@ from rag import (
     process_document, ask_question, stream_ask_question,
     clear_all_documents, get_system_status, get_project_name,
     get_model_type, UPLOADS_PATH, remove_document, list_documents,
-    warmup_models
+    warmup_models, is_business_question, detect_reply_language,
+    get_greeting_reply, classify_smalltalk, is_identity_question
 )
 
 
@@ -63,6 +65,8 @@ def health_check():
         "status": "ok",
         "ok": True,
         "model": sys_status.get("active_model") or sys_status.get("model_configured") or "none",
+        "model_configured": sys_status.get("model_configured") or "none",
+        "embedding_model": sys_status.get("embedding_model") or "none",
         "chunks_indexed": sys_status.get("chunks_indexed", 0),
         "ollama_status": "online" if sys_status.get("ollama_online") else "offline",
         "ollama_online": sys_status.get("ollama_online", False),
@@ -170,6 +174,40 @@ def chat(request: ChatRequest):
         if not request.question or not request.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+        q = request.question.strip()
+        selected_doc = (request.selected_doc or "").strip() or None
+
+        if not selected_doc:
+            is_greeting_or_smalltalk = bool(
+                get_greeting_reply(q) or classify_smalltalk(q)[0] or is_identity_question(q)
+            )
+            if not is_greeting_or_smalltalk and is_business_question(q):
+                lang = detect_reply_language(q)
+                prompt_msg = (
+                    "Document upload pannunga, adhula irundhu answer pannuren."
+                    if lang == "Tanglish"
+                    else "Please upload a document so I can answer from it."
+                )
+                if request.stream:
+                    def prompt_upload_stream():
+                        yield f"data: {json.dumps({'token': prompt_msg})}\n\n"
+                        yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
+
+                    return StreamingResponse(
+                        prompt_upload_stream(),
+                        media_type="text/event-stream"
+                    )
+                return ChatResponse(
+                    answer=prompt_msg,
+                    sources=[],
+                    mode="direct",
+                    project_name=get_project_name(),
+                    model_type=get_model_type(),
+                    escalate=False,
+                )
+
+        effective_mode = request.mode if selected_doc else "direct"
+
         if request.stream:
             def safe_event_stream():
                 import json as _json
@@ -177,8 +215,8 @@ def chat(request: ChatRequest):
                     for chunk in stream_ask_question(
                         request.question,
                         history=request.history,
-                        mode=request.mode,
-                        selected_doc=request.selected_doc
+                        mode=effective_mode,
+                        selected_doc=selected_doc
                     ):
                         yield chunk
                 except Exception as stream_exc:
@@ -195,8 +233,8 @@ def chat(request: ChatRequest):
         result = ask_question(
             request.question,
             history=request.history,
-            mode=request.mode,
-            selected_doc=request.selected_doc
+            mode=effective_mode,
+            selected_doc=selected_doc
         )
         result["project_name"] = result.get("project_name", get_project_name())
         result["model_type"] = result.get("model_type", get_model_type())

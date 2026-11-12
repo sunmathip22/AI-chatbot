@@ -30,7 +30,7 @@ Install these before anything else:
     ollama pull gemma2:2b
 
   Alternative (larger multimodal model, ~5.7GB):
-    ollama pull gemma3n:e2b
+    ollama pull qwen2.5:1.5b
 
   Note: The chatbot automatically detects whichever model you have downloaded!
 
@@ -122,8 +122,8 @@ Install these before anything else:
   "Connection refused on port 11434"
     →  Run: ollama serve
 
-  "model gemma3n:e2b not found"
-    →  Run: ollama pull gemma3n:e2b
+  "model qwen2.5:1.5b not found"
+    →  Run: ollama pull qwen2.5:1.5b
 
   "Activate.ps1 cannot be loaded"
     →  Run: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser

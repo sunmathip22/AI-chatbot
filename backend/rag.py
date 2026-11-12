@@ -2,6 +2,7 @@ import os
 import re
 import json
 import math
+import random
 import shutil
 import time
 import difflib
@@ -61,7 +62,7 @@ except ImportError:
     pass
 
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL_NAME = ""
+DEFAULT_MODEL_NAME = "qwen2.5:1.5b"
 DEFAULT_EMBEDDING_MODEL_NAME = ""
 DEFAULT_GROQ_FALLBACK_MODEL = ""
 DEFAULT_PROJECT_NAME = "Project Documentation"
@@ -1312,8 +1313,8 @@ def get_active_model(status: dict | None = None) -> tuple[str, bool]:
         for m in status["models"]:
             if m == configured or m.startswith(f"{configured}:") or configured.startswith(f"{m}:"):
                 return m, True
-        print(f"[Ollama WARNING] Configured MODEL_NAME='{configured}' not found in installed models {status['models']}. "
-              f"Falling back to: {status['models'][0]}")
+        print(f"[Ollama WARNING] Configured MODEL_NAME='{configured}' is not pulled in Ollama. "
+              f"Run: ollama pull {configured} (falling back to: {status['models'][0]})", flush=True)
     else:
         print(f"[Ollama WARNING] MODEL_NAME is not set in .env. Falling back to: {status['models'][0]}")
 
@@ -1346,11 +1347,12 @@ def get_missing_info_response(query: str, lang: str = "English") -> str:
 def get_slm_rag_prompt(lang: str = "English", is_list: bool = False) -> str:
     top_line = get_language_system_line(lang)
     missing_phrase = get_missing_info_response("", lang)
+    end_q = "Edhu pathi details venum?" if lang.lower() in ("tanglish", "thanglish", "tamil") else "What would you like to know?"
     if is_list:
         detail_rule = (
-            "- Give a short summary: the business name, what it offers, and the main items (up to six items) from the context "
-            "using ONLY the exact prices and numbers printed in the context (use '- ' bullets, never guess numbers or sizes). "
-            "Never use vague words like 'various', 'many', 'other products', 'different options', 'some items'."
+            "- Give a SHORT natural summary in 2-3 sentences: the business name, what it sells or offers, where it is, and the timing, "
+            f"using ONLY facts from the context. End with '{end_q}'. "
+            "If the context has table rows, rewrite them as normal sentences. Never output headings or raw table rows."
         )
     else:
         detail_rule = (
@@ -1363,6 +1365,7 @@ def get_slm_rag_prompt(lang: str = "English", is_list: bool = False) -> str:
         f"{top_line}\n"
         "Customer assistant for a business.\n"
         "Rules:\n"
+        "- Write in your own words as a short friendly assistant. Do not copy the context text. Do not output table rows or symbols like |. Always finish the last sentence.\n"
         "- Answer using ONLY the provided context. Never invent prices, offers, or policies.\n"
         "- Start the reply with the answer directly. No greeting, no self-introduction.\n"
         f"{detail_rule}\n"
@@ -1522,39 +1525,79 @@ def classify_smalltalk(query: str) -> tuple[bool, str | None, str | None]:
     if greet_reply:
         return True, greet_reply, "greeting"
 
-    # 1. Thanks variations
-    thanks_patterns = [
-        r"^(thanks|thank you|thank u|thx|tq|many thanks|thanks a lot|thanks bro|thanks pa)$",
-        r"\b(thank you|thanks a lot|many thanks|thanks so much)\b",
-        r"^(nandri|romba nandri|mikka nandri|நன்றி|மிக்க நன்றி)$",
-        r"\b(romba nandri|mikka nandri)\b"
-    ]
-    if any(re.search(p, q_norm) for p in thanks_patterns):
-        if lang == "tamil":
-            return True, "மிக்க மகிழ்ச்சி! (You're welcome!)", "thanks"
-        return True, "You're welcome!", "thanks"
+    # 1. Closer & polite replies (whole-message match after trimming spaces & punctuation)
+    q_closer = re.sub(r"[^\w\s\u0B80-\u0BFF]", "", q_clean)
+    q_closer = re.sub(r"\s+", " ", q_closer).strip()
 
-    # 2. Bye variations
-    bye_patterns = [
-        r"^(bye|goodbye|bye bye|see you|cya|take care|good night|bye bro|bye pa)$",
-        r"\b(bye bye|good bye|see you later)\b",
-        r"^(poittu varen|kelambren|varata|போய் வருகிறேன்|சென்று வருகிறேன்)$",
-        r"\b(poittu varen|varata bro|bye bro)\b"
-    ]
-    if any(re.search(p, q_norm) for p in bye_patterns):
-        if lang == "tamil":
-            return True, "சென்று வாருங்கள், இனிய நாளாக அமையட்டும்!", "bye"
-        return True, "Bye, have a nice day!", "bye"
+    _ok_words = {
+        "ok", "okay", "okk", "k", "kk", "alright", "fine", "cool", "sure",
+        "super", "nice", "understood", "done", "aama", "seri", "seripa", "sari",
+    }
+    _ok_phrases = {"got it", "ok ok", "seri seri", "ok fine", "ok sure", "okay fine"}
+    _thanks_words = {"thanks", "thx", "tq", "ty", "nandri"}
+    _thanks_phrases = {
+        "thank you", "thank u", "many thanks", "thanks a lot", "thanks so much",
+        "romba nandri", "mikka nandri", "thanks bro", "thanks pa",
+    }
+    _bye_words = {"bye", "goodbye", "cya", "gn", "podhum", "poittu", "kelambren", "varata"}
+    _bye_phrases = {
+        "bye bye", "good bye", "see you", "see you later", "take care",
+        "good night", "thats all", "that s all", "athu podhum", "adhu podhum",
+        "poittu varen", "bye bro", "bye pa", "varata bro",
+    }
+    _tanglish_closer_markers = {"seri", "seripa", "sari", "aama", "nandri", "romba", "mikka", "athu", "adhu", "podhum", "poittu", "varen", "kelambren", "varata"}
 
-    # 3. Ok / Acknowledgement variations
-    ok_patterns = [
-        r"^(ok|okay|okk|k|kk|alright|fine|cool|sure|got it|done)$",
-        r"^(seri|seripa|seri bro|aama|sari|சரி|ஆமாம்|ஓகே)$"
-    ]
-    if any(re.search(p, q_norm) for p in ok_patterns):
-        if lang == "tamil":
-            return True, "சரி! உங்களுக்கு வேறு ஏதேனும் உதவி தேவைப்பட்டால் சொல்லுங்கள்.", "ok"
-        return True, "Alright! Let me know if you need anything else.", "ok"
+    closer_tokens = q_closer.split()
+    all_closer_words = _ok_words | _thanks_words | _bye_words | {"got", "it", "thank", "you", "u", "many", "a", "lot", "so", "much", "romba", "mikka", "bro", "pa", "good", "bye", "see", "later", "take", "care", "night", "thats", "that", "s", "all", "athu", "adhu", "varen"}
+
+    is_whole_closer = bool(closer_tokens) and (
+        q_closer in (_ok_phrases | _thanks_phrases | _bye_phrases)
+        or (len(closer_tokens) <= 4 and all(t in all_closer_words for t in closer_tokens))
+    )
+
+    if is_whole_closer:
+        is_tanglish_closer = (lang in ("thanglish", "tamil")) or any(t in _tanglish_closer_markers for t in closer_tokens)
+        has_bye = (q_closer in _bye_phrases) or any(t in _bye_words for t in closer_tokens) or any(p in q_closer for p in _bye_phrases)
+        has_thanks = (q_closer in _thanks_phrases) or any(t in _thanks_words for t in closer_tokens) or any(p in q_closer for p in _thanks_phrases)
+
+        if has_bye:
+            if is_tanglish_closer:
+                reply = random.choice([
+                    "Seri, nandri! Naalaikku paapom.",
+                    "Seri pa, bye! Vera help venum na eppovum kelunga.",
+                ])
+            else:
+                reply = random.choice([
+                    "Bye, have a nice day!",
+                    "See you! Feel free to reach out anytime.",
+                ])
+            return True, reply, "bye"
+
+        if has_thanks:
+            if is_tanglish_closer:
+                reply = random.choice([
+                    "Nandri! Vera help venum na kelunga.",
+                    "Romba nandri! Edhavadhu venum na kelunga.",
+                ])
+            else:
+                reply = random.choice([
+                    "You're welcome! Happy to help.",
+                    "Glad I could help!",
+                ])
+            return True, reply, "thanks"
+
+        # Default closer: ok / fine / seri / super / nice / got it / understood
+        if is_tanglish_closer:
+            reply = random.choice([
+                "Seri! Vera edhavadhu venum na kelunga.",
+                "Seri pa! Vera details venum na kelunga.",
+            ])
+        else:
+            reply = random.choice([
+                "Sure! Let me know if you need anything else.",
+                "Okay! Feel free to ask me anything.",
+            ])
+        return True, reply, "ok"
 
     # 4. Greetings
     greeting_patterns = [
@@ -1593,10 +1636,14 @@ def is_about_question(query: str) -> bool:
         r"\bnee edha pathi\b",
         r"\bnee ethu pathi\b",
         r"\bnee edhukku\b",
+        r"\bun kitta enna details\b",
+        r"\benna details irukku\b",
+        r"\bwhat details do you have\b",
         r"\bwhat (is this|is it) about\b",
         r"\bwhat can you (tell|explain|say)\b",
-        r"\bwhat do you (do|explain|cover|know about)\b",
+        r"\bwhat do you (do|explain|cover|know about|have)\b",
         r"\bwhat (are you|is this)\b",
+        r"\bwho are you\b",
         r"\btell me about (this|yourself|your (shop|store|business))\b",
         r"\babout (this|your (shop|store|business))\b",
         r"\bivan (edha|edhula) pathi\b",
@@ -1983,21 +2030,49 @@ _UPLOAD_ACK_WORDS = {
 
 
 def is_upload_ack_message(query: str) -> bool:
-    """Detect non-question upload notifications and short acknowledgements (ok, done, thanks)."""
-    if not query or not query.strip():
-        return False
-    q_raw = query.strip()
-    q_norm = re.sub(r"[^\w\s]", "", q_raw.lower())
-    q_norm = re.sub(r"\s+", " ", q_norm).strip()
-    if q_norm in _UPLOAD_ACK_EXACT:
-        return True
-    words = q_norm.split()
-    if 1 <= len(words) <= 4 and all(w in _UPLOAD_ACK_WORDS for w in words):
-        return True
-    if "?" not in q_raw and ("upload" in q_norm or "uploaded" in q_norm):
-        if not is_business_question(q_norm) and not is_list_or_overview_question(q_norm):
-            return True
+    """Disabled for chat messages; upload acknowledgements are shown only by the UI upload action."""
     return False
+
+
+def postcheck_overview_reply(text: str, lang: str = "English") -> str:
+    """
+    Clean overview replies without an extra LLM call:
+    remove '|' table parts and cut at the last complete sentence.
+    Falls back to a fixed short overview if nothing usable remains.
+    """
+    norm_lang = (lang or "English").lower()
+    if norm_lang in ("tanglish", "thanglish"):
+        fallback = "Vanakkam! Enga products, price, offers, delivery matrum timings pathi naan help pannuren. Edhu pathi details venum?"
+    elif norm_lang == "tamil":
+        fallback = "வணக்கம்! எங்கள் products, price, offers, delivery மற்றும் timings பற்றி நான் help பண்ணுகிறேன். எதைப் பற்றி details வேண்டும்?"
+    else:
+        fallback = "Hi! I can help you with our products, prices, offers, delivery and timings. What would you like to know?"
+
+    if not text or not text.strip():
+        return fallback
+
+    cleaned = text.strip()
+    needs_clean = (cleaned.count("|") >= 2) or not re.search(r"[.?!\u0964]$", cleaned)
+    if not needs_clean:
+        return cleaned
+
+    if "|" in cleaned:
+        kept_lines = [ln for ln in cleaned.splitlines() if "|" not in ln]
+        cleaned = "\n".join(kept_lines).strip()
+        if "|" in cleaned:
+            cleaned = re.sub(r"[^.!?\n]*\|[^.!?\n]*", "", cleaned).strip()
+
+    if cleaned and not re.search(r"[.?!\u0964]$", cleaned):
+        m = list(re.finditer(r"[.?!\u0964]", cleaned))
+        if m:
+            cleaned = cleaned[: m[-1].end()].strip()
+        else:
+            cleaned = ""
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) < 15:
+        return fallback
+    return cleaned
 
 
 def get_upload_ack_reply(query: str) -> str:
@@ -2348,7 +2423,7 @@ def warmup_models():
     except Exception as e:
         print(f"[Startup Warning] Model warmup notice: {e}")
     active_m, _ = get_active_model()
-    print(f"[Startup] Ready | Model: {active_m or get_configured_model() or 'none'} | Embedding: {get_embedding_model_name() or 'none'} | Documents: {len(_store.file_registry)} ({_store.count()} chunks)", flush=True)
+    print(f"Chat model: {active_m or get_configured_model() or 'none'} | Embedding model: {get_embedding_model_name() or 'none'} | Ollama URL: {get_ollama_base_url()}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2398,16 +2473,15 @@ def ask_question(
             add_conversation_turn(q, greeting_reply, detect_language_style(q))
             return res
 
-        # 2. Upload / Acknowledgement check (never trigger retrieval or fallback)
-        if is_upload_ack_message(q):
-            ack_reply = get_upload_ack_reply(q)
-            t_total = time.perf_counter() - t_start
-            print(f"[ROUTE] upload-ack | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
-            res = {"answer": ack_reply, "sources": [], "mode": "direct", "escalate": False}
-            add_conversation_turn(q, ack_reply, detect_language_style(q))
-            return res
-
+        # 2. Closers & small talk handled without LLM or retrieval (uncached for natural variations)
         lang = detect_language_style(q)
+        is_st, st_reply, st_cat = classify_smalltalk(q)
+        if is_st:
+            res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
+            add_conversation_turn(q, st_reply, lang)
+            t_total = time.perf_counter() - t_start
+            print(f"[ROUTE] {st_cat or 'smalltalk'} | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            return res
 
         # 3. In-memory cache check (< 1 ms)
         cached = get_cached_response(q, doc_key=doc_key)
@@ -2416,18 +2490,12 @@ def ask_question(
             print(f"[ROUTE] {cached.get('route', 'rag-answer')} (cache) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
             return cached
 
-        # 4. Smalltalk handled without LLM or retrieval
-        is_st, st_reply, _ = classify_smalltalk(q)
-        if is_st:
-            res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
-            set_cached_response(q, res, doc_key=doc_key)
-            add_conversation_turn(q, st_reply, lang)
-            t_total = time.perf_counter() - t_start
-            print(f"[ROUTE] greeting (smalltalk) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
-            return res
+        raw_history = history if isinstance(history, list) else get_conversation_history()
+        active_history = raw_history[-2:] if isinstance(raw_history, list) and raw_history else []
+        chunk_count = _store.count()
 
-        # 5. Identity check
-        if is_identity_question(q):
+        # 4. Identity check (only when no document is active / direct mode, otherwise route to overview)
+        if is_identity_question(q) and (chunk_count == 0 or mode == "direct" or not is_about_question(q)):
             resp = get_identity_response(lang)
             res = {"answer": resp, "sources": [], "mode": "direct", "escalate": False}
             set_cached_response(q, res, doc_key=doc_key)
@@ -2435,11 +2503,7 @@ def ask_question(
             print(f"[ROUTE] greeting (identity) | Query: '{_safe_log_str(q)}'", flush=True)
             return res
 
-        raw_history = history if isinstance(history, list) else get_conversation_history()
-        active_history = raw_history[-2:] if isinstance(raw_history, list) and raw_history else []
-        chunk_count = _store.count()
-
-        # 6. Overview / List question -> retrieve from beginning + catalog chunks of active doc
+        # 5. Overview / List question -> retrieve from beginning + catalog chunks of active doc
         if is_list_or_overview_question(q) and chunk_count > 0 and mode != "direct":
             top_k_list = get_top_k_list()
             t_ret_start = time.perf_counter()
@@ -2462,12 +2526,8 @@ def ask_question(
                 t_gen = time.perf_counter() - t_gen_start
                 if ans:
                     cleaned = clean_model_output(ans, lang)
-                    ok_num, bad_nums = check_number_groundedness(cleaned, context_text)
+                    cleaned = postcheck_overview_reply(cleaned, detected_lang)
                     route_tag = "overview"
-                    if not ok_num:
-                        print(f"[GROUNDEDNESS FAIL] Overview unverified numbers {bad_nums} -> fallback", flush=True)
-                        cleaned = get_missing_info_response(q, detected_lang)
-                        route_tag = "fallback"
                     res = {"answer": cleaned, "sources": sources, "mode": "rag", "escalate": False}
                     set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
                     add_conversation_turn(q, cleaned, lang)
@@ -2652,17 +2712,16 @@ def stream_ask_question(
             yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
             return
 
-        # 2. Upload / Acknowledgement check (never trigger retrieval or fallback)
-        if is_upload_ack_message(q):
-            ack_reply = get_upload_ack_reply(q)
+        # 2. Closers & instant small talk (uncached for natural variations)
+        lang = detect_language_style(q)
+        is_st, st_reply, st_cat = classify_smalltalk(q)
+        if is_st:
+            add_conversation_turn(q, st_reply, lang)
             t_total = time.perf_counter() - t_start
-            print(f"[ROUTE] upload-ack | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
-            add_conversation_turn(q, ack_reply, detect_language_style(q))
-            yield f"data: {json.dumps({'token': ack_reply})}\n\n"
+            print(f"[ROUTE] {st_cat or 'smalltalk'} | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
+            yield f"data: {json.dumps({'token': st_reply})}\n\n"
             yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
             return
-
-        lang = detect_language_style(q)
 
         # 3. In-memory cache check
         cached = get_cached_response(q, doc_key=doc_key)
@@ -2673,20 +2732,12 @@ def stream_ask_question(
             yield f"data: {json.dumps({'done': True, 'sources': cached.get('sources', []), 'mode': cached.get('mode', 'direct'), 'escalate': cached.get('escalate', False)})}\n\n"
             return
 
-        # 4. Instant small talk
-        is_st, st_reply, _ = classify_smalltalk(q)
-        if is_st:
-            res = {"answer": st_reply, "sources": [], "mode": "direct", "escalate": False}
-            set_cached_response(q, {**res, "route": "greeting"}, doc_key=doc_key)
-            add_conversation_turn(q, st_reply, lang)
-            t_total = time.perf_counter() - t_start
-            print(f"[ROUTE] greeting (smalltalk) | Query: '{_safe_log_str(q)}' | Total: {t_total*1000:.1f}ms", flush=True)
-            yield f"data: {json.dumps({'token': st_reply})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
-            return
+        raw_history = history if isinstance(history, list) else get_conversation_history()
+        active_history = raw_history[-2:] if isinstance(raw_history, list) and raw_history else []
+        chunk_count = _store.count()
 
-        # 5. Identity check
-        if is_identity_question(q):
+        # 4. Identity check (only when no document is active / direct mode, otherwise route to overview)
+        if is_identity_question(q) and (chunk_count == 0 or mode == "direct" or not is_about_question(q)):
             resp = get_identity_response(lang)
             res = {"answer": resp, "sources": [], "mode": "direct", "escalate": False}
             set_cached_response(q, {**res, "route": "greeting"}, doc_key=doc_key)
@@ -2695,10 +2746,6 @@ def stream_ask_question(
             yield f"data: {json.dumps({'token': resp})}\n\n"
             yield f"data: {json.dumps({'done': True, 'sources': [], 'mode': 'direct', 'escalate': False})}\n\n"
             return
-
-        raw_history = history if isinstance(history, list) else get_conversation_history()
-        active_history = raw_history[-2:] if isinstance(raw_history, list) and raw_history else []
-        chunk_count = _store.count()
 
         # 6. Overview / List question -> retrieve opening + catalog chunks from active doc
         if is_list_or_overview_question(q) and chunk_count > 0 and mode != "direct":
@@ -2734,12 +2781,8 @@ def stream_ask_question(
 
                 full_ans = clean_model_output("".join(accumulated).strip(), lang)
                 if full_ans:
-                    ok_num, bad_nums = check_number_groundedness(full_ans, context_text)
+                    full_ans = postcheck_overview_reply(full_ans, detected_lang)
                     route_tag = "overview"
-                    if not ok_num:
-                        print(f"[GROUNDEDNESS FAIL] Overview unverified numbers {bad_nums} -> fallback", flush=True)
-                        full_ans = get_missing_info_response(q, detected_lang)
-                        route_tag = "fallback"
                     res = {"answer": full_ans, "sources": sources, "mode": "rag", "escalate": False}
                     set_cached_response(q, {**res, "route": route_tag}, doc_key=doc_key)
                     add_conversation_turn(q, full_ans, lang)
